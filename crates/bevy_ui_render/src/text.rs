@@ -13,7 +13,8 @@ use bevy_ui::{
 };
 
 use crate::{
-    stack_z_offsets, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType, UiCameraMap,
+    stack_z_offsets, text_scroll_clip, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes,
+    NodeType, UiCameraMap,
 };
 
 pub fn extract_text_cursor(
@@ -65,16 +66,7 @@ pub fn extract_text_cursor(
                 uinode.content_box().min - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
-        let clip = if text_scroll.is_some() {
-            let content_box = uinode.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
-        } else {
-            maybe_clip.map(|clip| clip.clip)
-        };
+        let clip = text_scroll_clip(global_transform, uinode, maybe_clip, text_scroll);
 
         let mut focused = false;
 
@@ -202,16 +194,7 @@ pub fn extract_preedit_underlines(
                 uinode.content_box().min - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
-        let clip = if text_scroll.is_some() {
-            let content_box = uinode.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
-        } else {
-            maybe_clip.map(|clip| clip.clip)
-        };
+        let clip = text_scroll_clip(global_transform, uinode, maybe_clip, text_scroll);
 
         let color = text_color.0.to_linear();
 

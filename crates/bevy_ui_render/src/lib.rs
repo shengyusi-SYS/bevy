@@ -386,6 +386,24 @@ impl ExtractedUiNodes {
     }
 }
 
+pub(crate) fn text_scroll_clip(
+    global_transform: &UiGlobalTransform,
+    uinode: &ComputedNode,
+    maybe_clip: Option<&CalculatedClip>,
+    text_scroll: Option<&TextScroll>,
+) -> Option<Rect> {
+    if text_scroll.is_some() {
+        let content_box = uinode.content_box();
+        let text_clip = Rect::from_center_size(
+            global_transform.affine().translation + content_box.center(),
+            content_box.size().max(Vec2::ZERO),
+        );
+        Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
+    } else {
+        maybe_clip.map(|clip| clip.clip)
+    }
+}
+
 pub fn extract_uinode_background_colors(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
@@ -1007,16 +1025,7 @@ pub fn extract_text_sections(
                 uinode.content_box().min - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
-        let clip = if text_scroll.is_some() {
-            let content_box = uinode.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
-        } else {
-            maybe_clip.map(|clip| clip.clip)
-        };
+        let clip = text_scroll_clip(global_transform, uinode, maybe_clip, text_scroll);
 
         let mut color = text_color.0.to_linear();
 
@@ -1149,16 +1158,7 @@ pub fn extract_text_shadows(
                     - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
-        let clip = if text_scroll.is_some() {
-            let content_box = uinode.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
-        } else {
-            maybe_clip.map(|clip| clip.clip)
-        };
+        let clip = text_scroll_clip(global_transform, uinode, maybe_clip, text_scroll);
 
         for (
             i,
@@ -1318,16 +1318,7 @@ pub fn extract_text_decorations(
                 uinode.content_box().min - text_scroll.map_or(Vec2::ZERO, |s| s.0),
             );
 
-        let clip = if text_scroll.is_some() {
-            let content_box = uinode.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(maybe_clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
-        } else {
-            maybe_clip.map(|clip| clip.clip)
-        };
+        let clip = text_scroll_clip(global_transform, uinode, maybe_clip, text_scroll);
 
         for run in text_layout_info.run_geometry.iter() {
             let Some(section_entity) = computed_block
