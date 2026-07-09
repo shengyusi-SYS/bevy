@@ -55,9 +55,12 @@ pub struct Monitor {
 )]
 pub struct PrimaryMonitor;
 
-/// A relationship for all Windows on a specific Monitor.
+/// A relationship for all windows currently located on a specific monitor.
+///
+/// This is intentionally not a linked-spawn relationship: monitors do not own
+/// windows. A monitor disappearing must clear `OnMonitor`, not despawn windows.
 #[derive(Component, Debug, Default)]
-#[relationship_target(relationship = crate::window::OnMonitor, linked_spawn)]
+#[relationship_target(relationship = crate::window::OnMonitor)]
 pub struct HasWindows(Vec<Entity>);
 
 impl Monitor {
@@ -82,4 +85,45 @@ pub struct VideoMode {
     pub bit_depth: u16,
     /// The refresh rate in millihertz
     pub refresh_rate_millihertz: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::window::{OnMonitor, Window};
+    use bevy_ecs::world::World;
+
+    fn test_monitor() -> Monitor {
+        Monitor {
+            name: Some("test-monitor".into()),
+            physical_height: 1080,
+            physical_width: 1920,
+            physical_position: IVec2::ZERO,
+            refresh_rate_millihertz: Some(60_000),
+            scale_factor: 1.0,
+            video_modes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn despawning_monitor_does_not_despawn_windows_on_it() {
+        let mut world = World::new();
+        let monitor = world.spawn(test_monitor()).id();
+        let window = world.spawn((Window::default(), OnMonitor(monitor))).id();
+
+        assert!(world.get::<HasWindows>(monitor).is_some());
+        assert!(world.get::<OnMonitor>(window).is_some());
+
+        world.entity_mut(monitor).despawn();
+        world.flush();
+
+        assert!(
+            world.get::<Window>(window).is_some(),
+            "monitor removal must not despawn windows that were on it"
+        );
+        assert!(
+            world.get::<OnMonitor>(window).is_none(),
+            "monitor removal should clear stale OnMonitor relationships"
+        );
+    }
 }

@@ -7,6 +7,7 @@ use bevy_ecs::{
     lifecycle::RemovedComponents,
     message::MessageWriter,
     prelude::{Changed, Commands, Component},
+    relationship::RelationshipTarget,
     system::{Local, NonSendMarker, Query, SystemParamItem},
 };
 use bevy_input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput};
@@ -176,7 +177,7 @@ pub(crate) fn check_keyboard_focus_lost(
 /// Synchronize available monitors as reported by [`winit`] with [`Monitor`] entities in the world.
 pub fn create_monitors(
     event_loop: &ActiveEventLoop,
-    (mut commands, mut monitors): SystemParamItem<CreateMonitorParams>,
+    (mut commands, mut monitors, has_windows): SystemParamItem<CreateMonitorParams>,
 ) {
     let primary_monitor = event_loop.primary_monitor();
     let mut seen_monitors = vec![false; monitors.monitors.len()];
@@ -228,7 +229,17 @@ pub fn create_monitors(
             idx += 1;
             true
         } else {
-            info!("Monitor removed {}", entity);
+            let attached_windows: Vec<Entity> = has_windows
+                .get(*entity)
+                .map(|windows| windows.iter().collect())
+                .unwrap_or_default();
+
+            info!(
+                monitor = %entity,
+                attached_window_count = attached_windows.len(),
+                attached_windows = ?attached_windows,
+                "Monitor removed"
+            );
             commands.entity(*entity).despawn();
             idx += 1;
             false
@@ -293,6 +304,91 @@ pub(crate) struct CachedWindow(Window);
 /// The cached state of the window so we can check which properties were changed from within the app.
 #[derive(Debug, Clone, Component, Deref, DerefMut)]
 pub(crate) struct CachedCursorOptions(CursorOptions);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorRelationshipAction {
+    Keep,
+    Insert(Entity),
+    Remove,
+}
+
+fn resolve_monitor_relationship(
+    current_monitor_entity: Option<Entity>,
+    existing_monitor_entity: Option<Entity>,
+    existing_monitor_still_live: bool,
+) -> MonitorRelationshipAction {
+    match (
+        current_monitor_entity,
+        existing_monitor_entity,
+        existing_monitor_still_live,
+    ) {
+        (Some(current), Some(existing), _) if current == existing => {
+            MonitorRelationshipAction::Keep
+        }
+        (Some(current), _, _) => MonitorRelationshipAction::Insert(current),
+        (None, Some(_), true) => MonitorRelationshipAction::Keep,
+        (None, Some(_), false) => MonitorRelationshipAction::Remove,
+        (None, None, _) => MonitorRelationshipAction::Keep,
+    }
+}
+
+fn sync_window_monitor_relationship(
+    commands: &mut Commands,
+    window_entity: Entity,
+    current_monitor: Option<winit::monitor::MonitorHandle>,
+    existing_monitor_entity: Option<Entity>,
+    monitors: &WinitMonitors,
+) {
+    let current_monitor_entity = current_monitor.and_then(|current| {
+        monitors
+            .monitors
+            .iter()
+            .find(|(handle, _)| handle == &current)
+            .map(|(_, entity)| *entity)
+    });
+
+    let existing_monitor_still_live =
+        existing_monitor_entity.is_some_and(|entity| monitors.find_entity(entity).is_some());
+
+    match resolve_monitor_relationship(
+        current_monitor_entity,
+        existing_monitor_entity,
+        existing_monitor_still_live,
+    ) {
+        MonitorRelationshipAction::Keep => {}
+        MonitorRelationshipAction::Insert(monitor_entity) => {
+            commands
+                .entity(window_entity)
+                .insert(OnMonitor(monitor_entity));
+        }
+        MonitorRelationshipAction::Remove => {
+            commands.entity(window_entity).remove::<OnMonitor>();
+        }
+    }
+}
+
+pub(crate) fn sync_window_monitor_relationships(
+    mut commands: Commands,
+    windows: Query<(Entity, Option<&OnMonitor>), With<Window>>,
+    monitors: Res<WinitMonitors>,
+    _non_send_marker: NonSendMarker,
+) {
+    WINIT_WINDOWS.with_borrow(|winit_windows| {
+        for (entity, relationship) in &windows {
+            let Some(winit_window) = winit_windows.get_window(entity) else {
+                continue;
+            };
+
+            sync_window_monitor_relationship(
+                &mut commands,
+                entity,
+                winit_window.current_monitor(),
+                relationship.map(|relationship| relationship.0),
+                &monitors,
+            );
+        }
+    });
+}
 
 /// Propagates changes from [`Window`] entities to the [`winit`] backend.
 ///
@@ -476,23 +572,13 @@ pub(crate) fn changed_windows(
                 );
             }
 
-            if let Some(monitor_link) = monitor_relationship {
-                if let Some(winit_monitor) = winit_window.current_monitor() {
-                    if let Some(linked_monitor) = monitors.find_entity(monitor_link.0) &&
-                        winit_monitor != linked_monitor &&
-                        let Some((_, winit_monitor_entity)) = monitors.monitors.iter().find(|(h, _)| h == &winit_monitor) {
-                        commands.entity(entity).insert(OnMonitor(winit_monitor_entity.to_owned()));
-                    }
-                } else {
-                    commands.entity(entity).remove::<OnMonitor>();
-                }
-            } else {
-                if let Some(winit_monitor) = winit_window.current_monitor()
-                    && let Some((_, winit_monitor_entity)) = monitors.monitors.iter()
-                    .find(|(h, _)| h == &winit_monitor) {
-                    commands.entity(entity).insert(OnMonitor(winit_monitor_entity.to_owned()));
-                }
-            }
+            sync_window_monitor_relationship(
+                &mut commands,
+                entity,
+                winit_window.current_monitor(),
+                monitor_relationship.map(|relationship| relationship.0),
+                &monitors,
+            );
 
             if let Some(maximized) = window.internal.take_maximize_request() {
                 winit_window.set_maximized(maximized);
@@ -657,3 +743,53 @@ pub(crate) fn changed_cursor_options(
 /// When a window is unfocused, this is used to send key release events for all the currently held keys.
 #[derive(Default, Component)]
 pub struct WinitWindowPressedKeys(pub(crate) HashMap<KeyCode, Key>);
+
+#[cfg(test)]
+mod monitor_relationship_tests {
+    use super::*;
+    use bevy_ecs::entity::Entity;
+
+    fn e(index: u32) -> Entity {
+        Entity::from_raw_u32(index).expect("valid test entity index")
+    }
+
+    #[test]
+    fn keeps_matching_monitor_relationship() {
+        assert_eq!(
+            resolve_monitor_relationship(Some(e(1)), Some(e(1)), true),
+            MonitorRelationshipAction::Keep
+        );
+    }
+
+    #[test]
+    fn inserts_when_current_monitor_changes() {
+        assert_eq!(
+            resolve_monitor_relationship(Some(e(2)), Some(e(1)), true),
+            MonitorRelationshipAction::Insert(e(2))
+        );
+    }
+
+    #[test]
+    fn inserts_when_current_monitor_reappears_without_existing_relationship() {
+        assert_eq!(
+            resolve_monitor_relationship(Some(e(2)), None, false),
+            MonitorRelationshipAction::Insert(e(2))
+        );
+    }
+
+    #[test]
+    fn keeps_live_relationship_when_current_monitor_is_temporarily_unknown() {
+        assert_eq!(
+            resolve_monitor_relationship(None, Some(e(1)), true),
+            MonitorRelationshipAction::Keep
+        );
+    }
+
+    #[test]
+    fn removes_stale_relationship_when_monitor_entity_is_gone() {
+        assert_eq!(
+            resolve_monitor_relationship(None, Some(e(1)), false),
+            MonitorRelationshipAction::Remove
+        );
+    }
+}

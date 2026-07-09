@@ -23,8 +23,11 @@ use winit::{event_loop::EventLoop, window::WindowId};
 use bevy_a11y::AccessibilityRequested;
 use bevy_app::{App, Last, Plugin};
 use bevy_ecs::prelude::*;
-use bevy_window::{CursorOptions, Window, WindowCreated};
-use system::{changed_cursor_options, changed_windows, check_keyboard_focus_lost, despawn_windows};
+use bevy_window::{CursorOptions, HasWindows, Window, WindowCreated};
+use system::{
+    changed_cursor_options, changed_windows, check_keyboard_focus_lost, despawn_windows,
+    sync_window_monitor_relationships,
+};
 pub use system::{create_monitors, create_windows};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use winit::platform::web::CustomCursorExtWebSys;
@@ -137,6 +140,7 @@ impl Plugin for WinitPlugin {
                 Last,
                 (
                     changed_windows,
+                    sync_window_monitor_relationships,
                     changed_cursor_options,
                     despawn_windows.after(ExitSystems),
                     check_keyboard_focus_lost,
@@ -245,4 +249,8 @@ pub type CreateWindowParams<'w, 's> = (
 );
 
 /// The parameters of the [`create_monitors`] system.
-pub type CreateMonitorParams<'w, 's> = (Commands<'w, 's>, ResMut<'w, WinitMonitors>);
+pub type CreateMonitorParams<'w, 's> = (
+    Commands<'w, 's>,
+    ResMut<'w, WinitMonitors>,
+    Query<'w, 's, &'static HasWindows>,
+);
