@@ -2746,7 +2746,7 @@ impl BorderRadius {
         viewport_size: Vec2,
     ) -> f32 {
         if let Ok(radius) = radius.resolve(scale_factor, min_length, viewport_size) {
-            radius.clamp(0., 0.5 * min_length)
+            radius.clamp(0., (0.5 * min_length).max(0.))
         } else {
             0.
         }
