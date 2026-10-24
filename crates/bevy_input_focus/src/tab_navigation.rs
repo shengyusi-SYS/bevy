@@ -62,6 +62,28 @@ use {
 )]
 pub struct TabIndex(pub i32);
 
+/// Excludes an entity and its descendants from sequential tab navigation when `true`.
+///
+/// Any ancestor with this component set to `true` excludes the entire subtree, including
+/// nested [`TabGroup`]s. Setting this component to `false` allows normal navigation unless
+/// another ancestor disables it. The value can be changed in place without changing
+/// [`TabIndex`] or the entity hierarchy.
+///
+/// This only affects sequential navigation; it does not prevent direct focus selection.
+#[derive(Debug, Component, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Debug, Default, Component, PartialEq, Clone)
+)]
+pub struct TabNavigationDisabled(pub bool);
+
+impl Default for TabNavigationDisabled {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 /// A component used to mark a tree of entities as containing tabbable elements.
 #[derive(Debug, Default, Component, Copy, Clone)]
 #[cfg_attr(
@@ -168,6 +190,8 @@ pub struct TabNavigation<'w, 's> {
     >,
     // Query for parents.
     parent_query: Query<'w, 's, &'static ChildOf>,
+    // Explicit sequential-navigation exclusions, independent of rendering or direct focus.
+    disabled_query: Query<'w, 's, &'static TabNavigationDisabled>,
 }
 
 impl TabNavigation<'_, '_> {
@@ -221,6 +245,10 @@ impl TabNavigation<'_, '_> {
             return Err(TabNavigationError::NoTabGroups);
         }
 
+        if self.is_disabled(parent) {
+            return Err(TabNavigationError::NoFocusableEntities);
+        }
+
         // Look for the tab group on the parent entity.
         match self.tabgroup_query.get(parent) {
             Ok(tabgroup) => self.navigate_internal(None, action, Some((parent, tabgroup.1))),
@@ -234,6 +262,7 @@ impl TabNavigation<'_, '_> {
         action: NavAction,
         tabgroup: Option<(Entity, &TabGroup)>,
     ) -> Result<Entity, TabNavigationError> {
+        let tabgroup = tabgroup.filter(|(entity, _)| !self.is_disabled(*entity));
         let navigation_result = self.navigate_in_group(tabgroup, focus, action);
 
         match navigation_result {
@@ -277,7 +306,7 @@ impl TabNavigation<'_, '_> {
                 let mut tab_groups: Vec<(Entity, TabGroup)> = self
                     .tabgroup_query
                     .iter()
-                    .filter(|(_, tg, _)| !tg.modal)
+                    .filter(|(entity, tg, _)| !tg.modal && !self.is_disabled(*entity))
                     .map(|(e, tg, _)| (e, *tg))
                     .collect();
                 // Stable sort by group order
@@ -327,6 +356,9 @@ impl TabNavigation<'_, '_> {
         parent: Entity,
         tab_group_idx: usize,
     ) {
+        if self.is_disabled(parent) {
+            return;
+        }
         if let Ok((entity, tabindex, children)) = self.tabindex_query.get(parent) {
             if let Some(tabindex) = tabindex
                 && tabindex.0 >= 0
@@ -348,6 +380,16 @@ impl TabNavigation<'_, '_> {
                 self.gather_focusable(out, *child, tab_group_idx);
             }
         }
+    }
+
+    fn is_disabled(&self, entity: Entity) -> bool {
+        core::iter::once(entity)
+            .chain(self.parent_query.iter_ancestors(entity))
+            .any(|entity| {
+                self.disabled_query
+                    .get(entity)
+                    .is_ok_and(|disabled| disabled.0)
+            })
     }
 }
 
@@ -541,5 +583,88 @@ mod tests {
         let prev_entity_from_start_of_group =
             tab_navigation.navigate(&InputFocus::from_entity(tab_entity_3), NavAction::Previous);
         assert_eq!(prev_entity_from_start_of_group, Ok(tab_entity_2));
+    }
+
+    #[test]
+    fn test_disabled_subtrees_are_excluded() {
+        let mut app = App::new();
+        let world = app.world_mut();
+
+        let disabled_parent = world.spawn(TabNavigationDisabled::default()).id();
+        let disabled_group = world
+            .spawn((TabGroup::new(-1), ChildOf(disabled_parent)))
+            .id();
+        world.spawn((TabIndex(0), ChildOf(disabled_group)));
+
+        let active_group = world.spawn(TabGroup::new(0)).id();
+        let first = world.spawn((TabIndex(0), ChildOf(active_group))).id();
+        let disabled_subtree = world
+            .spawn((
+                TabIndex(1),
+                TabNavigationDisabled(true),
+                ChildOf(active_group),
+            ))
+            .id();
+        world.spawn((TabIndex(1), ChildOf(disabled_subtree)));
+        let nested_group = world
+            .spawn((TabGroup::new(1), ChildOf(disabled_subtree)))
+            .id();
+        world.spawn((TabIndex(0), ChildOf(nested_group)));
+        let last = world.spawn((TabIndex(2), ChildOf(active_group))).id();
+
+        let mut system_state: SystemState<TabNavigation> = SystemState::new(world);
+        let navigation = system_state.get(world).unwrap();
+        for (focus, action, expected) in [
+            (None, NavAction::Next, first),
+            (None, NavAction::Previous, last),
+            (Some(first), NavAction::Next, last),
+            (Some(last), NavAction::Next, first),
+            (Some(last), NavAction::Previous, first),
+            (Some(first), NavAction::Previous, last),
+        ] {
+            let focus = focus.map(InputFocus::from_entity).unwrap_or_default();
+            assert_eq!(navigation.navigate(&focus, action), Ok(expected));
+        }
+        assert_eq!(
+            navigation.initialize(disabled_group, NavAction::First),
+            Err(TabNavigationError::NoFocusableEntities)
+        );
+    }
+
+    #[test]
+    fn test_disabled_group_can_be_enabled_in_place() {
+        let mut app = App::new();
+        let world = app.world_mut();
+        let parent = world.spawn(TabNavigationDisabled(true)).id();
+        let group = world
+            .spawn((
+                TabGroup::modal(),
+                TabNavigationDisabled(false),
+                ChildOf(parent),
+            ))
+            .id();
+        let first = world.spawn((TabIndex(0), ChildOf(group))).id();
+        let last = world.spawn((TabIndex(1), ChildOf(group))).id();
+        let mut system_state: SystemState<TabNavigation> = SystemState::new(world);
+
+        assert_eq!(
+            system_state
+                .get(world)
+                .unwrap()
+                .initialize(group, NavAction::First),
+            Err(TabNavigationError::NoFocusableEntities)
+        );
+        world.get_mut::<TabNavigationDisabled>(parent).unwrap().0 = false;
+        let navigation = system_state.get(world).unwrap();
+        assert_eq!(navigation.initialize(group, NavAction::First), Ok(first));
+        assert_eq!(navigation.initialize(group, NavAction::Last), Ok(last));
+        assert_eq!(
+            navigation.navigate(&InputFocus::from_entity(first), NavAction::Next),
+            Ok(last)
+        );
+        assert_eq!(
+            navigation.navigate(&InputFocus::from_entity(first), NavAction::Previous),
+            Ok(last)
+        );
     }
 }
