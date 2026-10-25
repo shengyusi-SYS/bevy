@@ -24,17 +24,29 @@
 //! be polled for completion.
 //!
 //! Images are supported on Windows and Unix when the `image` feature is enabled, which depends on `system_clipboard`.
-//! Image support is not available on wasm32, Android, or iOS.
+//! Image APIs are only compiled on supported native targets, not wasm32, Android, or iOS.
 
 extern crate alloc;
 
 use alloc::borrow::Cow;
-#[cfg(feature = "image")]
+#[cfg(all(
+    feature = "image",
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+))]
 use bevy_asset::RenderAssetUsages;
 use bevy_ecs::resource::Resource;
-#[cfg(feature = "image")]
+#[cfg(all(
+    feature = "image",
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+))]
 use bevy_image::Image;
-#[cfg(feature = "image")]
+#[cfg(all(
+    feature = "image",
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+))]
 use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 
 #[cfg(target_arch = "wasm32")]
@@ -112,7 +124,11 @@ impl<T> ClipboardRead<T> {
     }
 }
 
-#[cfg(feature = "image")]
+#[cfg(all(
+    feature = "image",
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+))]
 fn try_image_from_imagedata(image: arboard::ImageData<'static>) -> Result<Image, ClipboardError> {
     let size = Extent3d {
         width: u32::try_from(image.width).map_err(|_| ClipboardError::ConversionFailure)?,
@@ -128,7 +144,11 @@ fn try_image_from_imagedata(image: arboard::ImageData<'static>) -> Result<Image,
     ))
 }
 
-#[cfg(feature = "image")]
+#[cfg(all(
+    feature = "image",
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+))]
 fn try_imagedata_from_image(image: &Image) -> Result<arboard::ImageData<'_>, ClipboardError> {
     // arboard expects packed RGBA8.
     // We need to reject anything else: a same-size format like
@@ -189,35 +209,55 @@ fn try_imagedata_from_image(image: &Image) -> Result<arboard::ImageData<'_>, Cli
 /// or otherwise sharing it across threads, as this could lead to multiple instances attempting to access the clipboard simultaneously and causing a deadlock.
 #[derive(Resource)]
 pub struct Clipboard {
-    #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
+    #[cfg(all(
+        any(unix, windows),
+        not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+        feature = "system_clipboard"
+    ))]
     system_clipboard: Option<arboard::Clipboard>,
     // Unfortunately, this cannot be simplified to `not(any(feature = "system_clipboard", target_arch = "wasm32"))`.
-    // `system_clipboard` is a platform-conditional dependency (windows/unix only), so on other platforms
+    // `system_clipboard` is a platform-conditional dependency (supported native targets only), so on other platforms
     // (Android, iOS, etc.) `cfg(feature = "system_clipboard")` can be true even though the crate is not
     // present. Removing the platform guard would leave those targets with an empty struct and a
     // broken fallback. wasm32 is excluded separately because it calls web-sys directly and stores
     // no state in the struct.
     #[cfg(not(any(
-        all(any(windows, unix), feature = "system_clipboard"),
+        all(
+            any(unix, windows),
+            not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+            feature = "system_clipboard"
+        ),
         target_arch = "wasm32"
     )))]
     text: String,
 }
 
 #[cfg_attr(
-    not(all(any(unix, windows), feature = "system_clipboard")),
+    not(all(
+        any(unix, windows),
+        not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+        feature = "system_clipboard"
+    )),
     expect(
         clippy::derivable_impls,
-        reason = "non-derivable on unix/windows with system_clipboard"
+        reason = "non-derivable with a native system clipboard"
     )
 )]
 impl Default for Clipboard {
     fn default() -> Self {
         Self {
-            #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
+            #[cfg(all(
+                any(unix, windows),
+                not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+                feature = "system_clipboard"
+            ))]
             system_clipboard: arboard::Clipboard::new().ok(),
             #[cfg(not(any(
-                all(any(windows, unix), feature = "system_clipboard"),
+                all(
+                    any(unix, windows),
+                    not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+                    feature = "system_clipboard"
+                ),
                 target_arch = "wasm32"
             )))]
             text: String::new(),
@@ -230,7 +270,11 @@ impl Clipboard {
     ///
     /// On Windows and Unix `ClipboardRead`s are completed instantly, on wasm32 the result is fetched asynchronously.
     pub fn fetch_text(&mut self) -> ClipboardRead {
-        #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
+        #[cfg(all(
+            any(unix, windows),
+            not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+            feature = "system_clipboard"
+        ))]
         {
             ClipboardRead::Ready(
                 self.system_clipboard
@@ -262,11 +306,18 @@ impl Clipboard {
         }
 
         #[cfg(not(any(
-            all(any(windows, unix), feature = "system_clipboard"),
+            all(
+                any(unix, windows),
+                not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+                feature = "system_clipboard"
+            ),
             target_arch = "wasm32"
         )))]
         {
-            #[cfg(any(windows, unix))]
+            #[cfg(all(
+                any(unix, windows),
+                not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+            ))]
             bevy_log::warn_once!(
                 "Clipboard read used an in-process fallback buffer rather than the OS clipboard. \
                  Enable the `system_clipboard` feature on `bevy_clipboard` to use the OS clipboard."
@@ -278,7 +329,13 @@ impl Clipboard {
     /// Fetches image data from the clipboard.
     ///
     /// Only supported on Windows and Unix platforms with the `image` feature enabled.
-    #[cfg(feature = "image")]
+    #[cfg(all(
+        feature = "image",
+        all(
+            any(unix, windows),
+            not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+        )
+    ))]
     pub fn fetch_image(&mut self) -> Result<Image, ClipboardError> {
         self.system_clipboard
             .as_mut()
@@ -297,7 +354,11 @@ impl Clipboard {
     ///
     /// Returns error if `text` failed to be stored on the clipboard.
     pub fn set_text<'a, T: Into<Cow<'a, str>>>(&mut self, text: T) -> Result<(), ClipboardError> {
-        #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
+        #[cfg(all(
+            any(unix, windows),
+            not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+            feature = "system_clipboard"
+        ))]
         {
             self.system_clipboard
                 .as_mut()
@@ -321,11 +382,18 @@ impl Clipboard {
         }
 
         #[cfg(not(any(
-            all(any(windows, unix), feature = "system_clipboard"),
+            all(
+                any(unix, windows),
+                not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+                feature = "system_clipboard"
+            ),
             target_arch = "wasm32"
         )))]
         {
-            #[cfg(any(windows, unix))]
+            #[cfg(all(
+                any(unix, windows),
+                not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+            ))]
             bevy_log::warn_once!(
                 "Clipboard write used an in-process fallback buffer rather than the OS clipboard. \
                  Enable the `system_clipboard` feature on `bevy_clipboard` to use the OS clipboard."
@@ -343,7 +411,13 @@ impl Clipboard {
     /// # Errors
     ///
     /// Returns an error if the image data is invalid or the clipboard write fails.
-    #[cfg(feature = "image")]
+    #[cfg(all(
+        feature = "image",
+        all(
+            any(unix, windows),
+            not(any(target_os = "android", target_os = "ios", target_os = "emscripten"))
+        )
+    ))]
     pub fn set_image(&mut self, image: &Image) -> Result<(), ClipboardError> {
         self.system_clipboard
             .as_mut()
@@ -410,7 +484,11 @@ impl core::fmt::Display for ClipboardError {
 
 impl core::error::Error for ClipboardError {}
 
-#[cfg(all(any(windows, unix), feature = "system_clipboard"))]
+#[cfg(all(
+    any(unix, windows),
+    not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+    feature = "system_clipboard"
+))]
 impl From<arboard::Error> for ClipboardError {
     fn from(value: arboard::Error) -> Self {
         match value {
@@ -422,6 +500,30 @@ impl From<arboard::Error> for ClipboardError {
             _ => ClipboardError::Unknown {
                 description: "Unknown arboard error variant".to_owned(),
             },
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    not(all(
+        any(unix, windows),
+        not(any(target_os = "android", target_os = "ios", target_os = "emscripten")),
+        feature = "system_clipboard"
+    ))
+))]
+mod tests {
+    use super::Clipboard;
+
+    #[test]
+    fn fallback_text_roundtrips_and_replaces_previous_contents() {
+        let mut clipboard = Clipboard::default();
+        for text in ["first", "涟音 🎵\0text", ""] {
+            clipboard.set_text(text).unwrap();
+            let mut read = clipboard.fetch_text();
+            assert_eq!(read.poll_result().unwrap().unwrap(), text);
+            assert!(read.poll_result().is_none());
         }
     }
 }
