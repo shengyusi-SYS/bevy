@@ -207,7 +207,10 @@ pub async fn initialize_renderer(
         backends,
         flags: options.instance_flags,
         memory_budget_thresholds: options.instance_memory_budget_thresholds,
-        display: None,
+        display: options
+            .instance_display_handle
+            .as_ref()
+            .map(|display| Box::new(display.clone()) as Box<dyn wgpu::wgt::WgpuHasDisplayHandle>),
         backend_options: wgpu::BackendOptions {
             gl: wgpu::GlBackendOptions {
                 gles_minor_version: options.gles3_minor_version,

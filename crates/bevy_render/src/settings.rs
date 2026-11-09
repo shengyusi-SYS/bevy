@@ -7,6 +7,7 @@ use crate::{
 use alloc::borrow::Cow;
 use bevy_ecs::world::World;
 use bevy_image::{CompressedImageFormatSupport, CompressedImageFormats};
+use bevy_platform::sync::Arc;
 use bevy_window::RawHandleWrapperHolder;
 
 use wgpu::MemoryBudgetThresholds;
@@ -39,6 +40,10 @@ pub enum WgpuSettingsPriority {
 pub struct WgpuSettings {
     pub device_label: Option<Cow<'static, str>>,
     pub backends: Option<Backends>,
+    /// Owned window-system display used when creating the GPU instance.
+    /// Native GLES presentation needs the same display as its window surface.
+    /// `None` preserves display-independent instance initialization.
+    pub instance_display_handle: Option<Arc<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
     pub power_preference: PowerPreference,
     pub priority: WgpuSettingsPriority,
     /// The features to ensure are enabled regardless of what the adapter/backend supports.
@@ -146,6 +151,7 @@ impl Default for WgpuSettings {
         Self {
             device_label: Default::default(),
             backends,
+            instance_display_handle: None,
             power_preference,
             priority,
             features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
