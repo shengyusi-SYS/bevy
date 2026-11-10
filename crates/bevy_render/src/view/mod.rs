@@ -20,7 +20,7 @@ use crate::{
     render_resource::{
         BindGroup, DynamicUniformBuffer, ShaderType, Texture, TextureView, TextureViewId,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderAdapter, RenderDevice, RenderQueue},
     sync_world::MainEntity,
     texture::{
         CachedTexture, ColorAttachment, DepthStencilAttachment, GpuImage, ManualTextureViews,
@@ -1393,6 +1393,7 @@ fn main_texture_key(
 
 pub fn prepare_view_targets(
     mut commands: Commands,
+    render_adapter: Res<RenderAdapter>,
     clear_color_global: Res<ClearColor>,
     render_device: Res<RenderDevice>,
     mut texture_cache: ResMut<TextureCache>,
@@ -1458,6 +1459,13 @@ pub fn prepare_view_targets(
                 format: main_texture_format,
                 usage: texture_usage.0,
                 view_formats: match main_texture_format {
+                    _ if !render_adapter
+                        .get_downlevel_capabilities()
+                        .flags
+                        .contains(wgpu::DownlevelFlags::VIEW_FORMATS) =>
+                    {
+                        &[]
+                    }
                     TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
                     TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
                     _ => &[],
