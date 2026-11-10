@@ -77,6 +77,7 @@ use bevy_text::{
     UnderlineColor,
 };
 use bevy_transform::components::GlobalTransform;
+pub use box_shadow::BoxShadowCacheSettings;
 use box_shadow::BoxShadowPlugin;
 use bytemuck::{Pod, Zeroable};
 use core::ops::Range;
@@ -96,7 +97,8 @@ pub mod prelude {
     pub use crate::debug_overlay::{GlobalUiDebugOptions, UiDebugOptions};
 
     pub use crate::{
-        ui_material::*, ui_material_pipeline::UiMaterialPlugin, BoxShadowSamples, UiAntiAlias,
+        ui_material::*, ui_material_pipeline::UiMaterialPlugin, BoxShadowCacheSettings,
+        BoxShadowSamples, UiAntiAlias,
     };
 }
 

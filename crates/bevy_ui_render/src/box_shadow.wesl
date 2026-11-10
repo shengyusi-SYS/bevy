@@ -1,5 +1,4 @@
 import bevy_render::view::View;
-import bevy_render::globals::Globals;
 import bevy_render::writer_encode::writer_encode;
 import package::ui::select_corner_radius;
 
@@ -96,4 +95,49 @@ fn fragment(
 ) -> @location(0) vec4<f32> {
     let g = in.color.a * roundedBoxShadow(-0.5 * in.size, 0.5 * in.size, in.point, max(in.blur, 0.01), in.radius_x, in.radius_y);
     return writer_encode(vec4(in.color.rgb, g));
+}
+
+
+// Only the cached entry point reaches these bindings.
+@group(1) @binding(0) var shadow_texture: texture_2d<f32>;
+@group(1) @binding(1) var shadow_sampler: sampler;
+
+@fragment
+fn fragment_cached(in: BoxShadowVertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.point / (in.size + 6.0 * in.blur) + 0.5;
+    let coverage = textureSampleLevel(shadow_texture, shadow_sampler, uv, 0.0).r;
+    return writer_encode(vec4(in.color.rgb, in.color.a * coverage));
+}
+
+struct ShadowMask {
+    size: vec2<f32>,
+    bounds: vec2<f32>,
+    radius_x: vec4<f32>,
+    radius_y: vec4<f32>,
+    blur: f32,
+};
+
+// This entry point is independent of the view and output compositing space.
+@group(0) @binding(0) var<uniform> shadow_mask: ShadowMask;
+
+struct MaskVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn mask_vertex(@builtin(vertex_index) index: u32) -> MaskVertexOutput {
+    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    var out: MaskVertexOutput;
+    out.position = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn mask_fragment(in: MaskVertexOutput) -> @location(0) vec4<f32> {
+    let point = (in.uv - 0.5) * shadow_mask.bounds;
+    let coverage = roundedBoxShadow(-0.5 * shadow_mask.size, 0.5 * shadow_mask.size, point,
+        max(shadow_mask.blur, 0.01), shadow_mask.radius_x, shadow_mask.radius_y);
+    return vec4<f32>(coverage, 0.0, 0.0, 1.0);
 }

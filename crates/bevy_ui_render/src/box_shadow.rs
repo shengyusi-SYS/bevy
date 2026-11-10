@@ -1,5 +1,9 @@
 //! Box shadows rendering
 
+mod cache;
+use cache::BoxShadowCache;
+pub use cache::BoxShadowCacheSettings;
+
 use core::{hash::Hash, ops::Range};
 
 use bevy_app::prelude::*;
@@ -47,6 +51,7 @@ pub struct BoxShadowPlugin;
 impl Plugin for BoxShadowPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "box_shadow.wesl");
+        cache::install(app);
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -63,7 +68,9 @@ impl Plugin for BoxShadowPlugin {
                     Render,
                     (
                         queue_shadows.in_set(RenderSystems::Queue),
-                        prepare_shadows.in_set(RenderSystems::PrepareBindGroups),
+                        (cache::prepare_masks, prepare_shadows)
+                            .chain()
+                            .in_set(RenderSystems::PrepareBindGroups),
                     ),
                 );
         }
@@ -86,6 +93,7 @@ struct BoxShadowVertex {
 pub struct UiShadowsBatch {
     pub range: Range<u32>,
     pub camera: Entity,
+    pub mask_bind_group: Option<BindGroup>,
 }
 
 /// Contains the vertices and bind groups to be sent to the GPU
@@ -109,10 +117,17 @@ impl Default for BoxShadowMeta {
 #[derive(Resource)]
 pub struct BoxShadowPipeline {
     pub view_layout: BindGroupLayoutDescriptor,
+    pub mask_layout: BindGroupLayoutDescriptor,
+    pub texture_layout: BindGroupLayoutDescriptor,
+    pub mask_sampler: Sampler,
     pub shader: Handle<Shader>,
 }
 
-pub fn init_box_shadow_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
+pub fn init_box_shadow_pipeline(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    device: Res<RenderDevice>,
+) {
     let view_layout = BindGroupLayoutDescriptor::new(
         "box_shadow_view_layout",
         &BindGroupLayoutEntries::single(
@@ -123,8 +138,22 @@ pub fn init_box_shadow_pipeline(mut commands: Commands, asset_server: Res<AssetS
 
     commands.insert_resource(BoxShadowPipeline {
         view_layout,
+        mask_layout: cache::mask_layout(),
+        texture_layout: cache::texture_layout(),
+        mask_sampler: device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..default()
+        }),
         shader: load_embedded_asset!(asset_server.as_ref(), "box_shadow.wesl"),
     });
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub enum BoxShadowPipelineMode {
+    Analytic,
+    Cached,
+    Mask,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -133,6 +162,7 @@ pub struct BoxShadowPipelineKey {
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
     pub writer_encode: UiWriterEncodeKey,
+    pub mode: BoxShadowPipelineMode,
 }
 
 impl SpecializedRenderPipeline for BoxShadowPipeline {
@@ -163,26 +193,54 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
         let shader_defs = vec![ShaderDefVal::UInt("SHADOW_SAMPLES".into(), key.samples)];
         let mut fragment_defs = shader_defs.clone();
         key.writer_encode.push_shader_defs(&mut fragment_defs);
+        let (layout, vertex_entry, fragment_entry, buffers, blend, label) = match key.mode {
+            BoxShadowPipelineMode::Analytic => (
+                vec![self.view_layout.clone()],
+                "vertex",
+                "fragment",
+                vec![vertex_layout.clone()],
+                Some(BlendState::ALPHA_BLENDING),
+                "box_shadow_pipeline",
+            ),
+            BoxShadowPipelineMode::Cached => (
+                vec![self.view_layout.clone(), self.texture_layout.clone()],
+                "vertex",
+                "fragment_cached",
+                vec![vertex_layout],
+                Some(BlendState::ALPHA_BLENDING),
+                "box_shadow_cached_pipeline",
+            ),
+            BoxShadowPipelineMode::Mask => (
+                vec![self.mask_layout.clone()],
+                "mask_vertex",
+                "mask_fragment",
+                vec![],
+                None,
+                "box_shadow_mask_pipeline",
+            ),
+        };
 
         RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.shader.clone(),
                 shader_defs,
-                buffers: vec![vertex_layout],
+                entry_point: Some(vertex_entry.into()),
+                buffers,
                 ..default()
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 shader_defs: fragment_defs,
+                entry_point: Some(fragment_entry.into()),
                 targets: vec![Some(ColorTargetState {
                     format: key.target_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
                 ..default()
             }),
-            layout: vec![self.view_layout.clone()],
-            label: Some("box_shadow_pipeline".into()),
+            layout,
+            label: Some(label.into()),
             ..default()
         }
     }
@@ -420,7 +478,10 @@ pub fn queue_shadows(
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
+    mut cache: ResMut<BoxShadowCache>,
+    cache_settings: Res<BoxShadowCacheSettings>,
 ) {
+    cache.begin_frame(&cache_settings);
     let draw_function = draw_functions.read().id::<DrawBoxShadows>();
     let mut current_camera_entity = Entity::PLACEHOLDER;
     let mut current_phase = None;
@@ -443,13 +504,31 @@ pub fn queue_shadows(
                                         &box_shadow_pipeline,
                                         BoxShadowPipelineKey {
                                             target_format: view.target_format,
+                                            mode: BoxShadowPipelineMode::Analytic,
                                             samples: shadow_samples.copied().unwrap_or_default().0,
                                             writer_encode: UiWriterEncodeKey::from_resolved_space(
                                                 resolved_space,
                                             ),
                                         },
                                     );
-                                    (pipeline, transparent_phase)
+                                    let cached_pipeline = pipelines.specialize(
+                                        &pipeline_cache,
+                                        &box_shadow_pipeline,
+                                        BoxShadowPipelineKey {
+                                            target_format: view.target_format,
+                                            samples: shadow_samples.copied().unwrap_or_default().0,
+                                            writer_encode: UiWriterEncodeKey::from_resolved_space(
+                                                resolved_space,
+                                            ),
+                                            mode: BoxShadowPipelineMode::Cached,
+                                        },
+                                    );
+                                    (
+                                        pipeline,
+                                        cached_pipeline,
+                                        shadow_samples.copied().unwrap_or_default().0,
+                                        transparent_phase,
+                                    )
                                 })
                         })
                 },
@@ -457,13 +536,24 @@ pub fn queue_shadows(
             current_camera_entity = *extracted_camera_entity;
         }
 
-        let Some((pipeline, transparent_phase)) = current_phase.as_mut() else {
+        let Some((pipeline, cached_pipeline, samples, transparent_phase)) = current_phase.as_mut()
+        else {
             continue;
         };
         for (entity, extracted_shadow) in extracted_sub_shadows.iter() {
+            let cached = pipeline_cache
+                .get_render_pipeline(*cached_pipeline)
+                .is_some()
+                && cache.request(
+                    *entity,
+                    extracted_shadow,
+                    *samples,
+                    &cache_settings,
+                    &pipeline_cache,
+                );
             transparent_phase.add_transient(TransparentUi {
                 draw_function,
-                pipeline: *pipeline,
+                pipeline: if cached { *cached_pipeline } else { *pipeline },
                 entity: (*entity, *main_entity),
                 sort_key: FloatOrd(
                     extracted_shadow.stack_index as f32 + stack_z_offsets::BOX_SHADOW,
@@ -488,6 +578,8 @@ pub fn prepare_shadows(
     box_shadow_pipeline: Res<BoxShadowPipeline>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     mut previous_len: Local<usize>,
+    cache: Res<BoxShadowCache>,
+    segments: Res<crate::UiPassSegments>,
 ) {
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
         let mut batches: Vec<(Entity, UiShadowsBatch)> = Vec::with_capacity(*previous_len);
@@ -504,8 +596,12 @@ pub fn prepare_shadows(
         let mut vertices_index = 0;
         let mut indices_index = 0;
 
-        for ui_phase in phases.values_mut() {
+        for (view, ui_phase) in phases.iter_mut() {
+            let mut current_batch: Option<(usize, usize)> = None;
             for item_index in 0..ui_phase.items.len() {
+                if segments.breaks_batch(*view, item_index) {
+                    current_batch = None;
+                }
                 let item = &mut ui_phase.items[item_index];
                 let Some((extracted_camera_entity, box_shadow)) = extracted_shadows
                     .box_shadows
@@ -516,6 +612,7 @@ pub fn prepare_shadows(
                             .map(|box_shadow| (extracted_camera_entity, box_shadow))
                     })
                 else {
+                    current_batch = None;
                     continue;
                 };
 
@@ -570,20 +667,31 @@ pub fn prepare_shadows(
 
                 let index_count = 3 * (vertices.len() as u32 - 2);
 
-                batches.push((
-                    item.entity(),
-                    UiShadowsBatch {
-                        range: vertices_index..vertices_index + index_count,
-                        camera: *extracted_camera_entity,
-                    },
-                ));
-
+                let item_entity = item.entity();
+                let item_pipeline = item.pipeline;
+                let binding = cache.bindings.get(&item_entity);
+                let merge = current_batch.is_some_and(|(batch_item, batch_index)| {
+                    let batch: &UiShadowsBatch = &batches[batch_index].1;
+                    ui_phase.items[batch_item].pipeline == item_pipeline
+                        && batch.mask_bind_group.as_ref().map(BindGroup::id)
+                            == binding.map(BindGroup::id)
+                });
+                if !merge {
+                    batches.push((
+                        item_entity,
+                        UiShadowsBatch {
+                            range: vertices_index..vertices_index,
+                            camera: *extracted_camera_entity,
+                            mask_bind_group: binding.cloned(),
+                        },
+                    ));
+                    current_batch = Some((item_index, batches.len() - 1));
+                }
+                let (batch_item, batch_index) = current_batch.unwrap();
+                batches[batch_index].1.range.end += index_count;
+                ui_phase.items[batch_item].batch_range = batch_item as u32..item_index as u32 + 1;
                 vertices_index += index_count;
                 indices_index += vertices.len() as u32;
-
-                // shadows are sent to the gpu non-batched
-                *ui_phase.items[item_index].batch_range_mut() =
-                    item_index as u32..item_index as u32 + 1;
             }
         }
         ui_meta.vertices.write_buffer(&render_device, &render_queue);
@@ -593,7 +701,32 @@ pub fn prepare_shadows(
     }
 }
 
-pub type DrawBoxShadows = (SetItemPipeline, SetBoxShadowViewBindGroup<0>, DrawBoxShadow);
+pub type DrawBoxShadows = (
+    SetItemPipeline,
+    SetBoxShadowViewBindGroup<0>,
+    SetBoxShadowMaskBindGroup<1>,
+    DrawBoxShadow,
+);
+
+pub struct SetBoxShadowMaskBindGroup<const I: usize>;
+impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetBoxShadowMaskBindGroup<I> {
+    type Param = ();
+    type ViewQuery = ();
+    type ItemQuery = Read<UiShadowsBatch>;
+
+    fn render<'w>(
+        _item: &P,
+        _view: (),
+        batch: Option<&'w UiShadowsBatch>,
+        _param: (),
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        if let Some(binding) = batch.and_then(|batch| batch.mask_bind_group.as_ref()) {
+            pass.set_bind_group(I, binding, &[]);
+        }
+        RenderCommandResult::Success
+    }
+}
 
 pub struct SetBoxShadowViewBindGroup<const I: usize>;
 impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetBoxShadowViewBindGroup<I> {
