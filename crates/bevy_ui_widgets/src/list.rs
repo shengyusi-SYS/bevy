@@ -108,8 +108,8 @@ fn listbox_on_key_input(
             let list_items = q_children
                 .iter_descendants(listbox)
                 .filter_map(|child_id| match q_listitems.get(child_id) {
-                    Ok((selected, disabled)) => Some((child_id, selected, disabled)),
-                    Err(_) => None,
+                    Ok((selected, false)) => Some((child_id, selected, false)),
+                    Ok((_, true)) | Err(_) => None,
                 })
                 .collect::<Vec<_>>();
             if list_items.is_empty() {
@@ -317,6 +317,9 @@ fn listbox_focus_gained(
             commands
                 .entity(listbox)
                 .insert(ActiveDescendant(Some(list_items[first_selected].0)));
+            commands.trigger(ScrollIntoView {
+                entity: list_items[first_selected].0,
+            });
         }
     }
 }

@@ -71,7 +71,7 @@ fn modal_dialog_barrier_on_keypress(
 ) {
     if q_barrier.contains(ev.event_target()) {
         let event = &ev.event().input;
-        if !event.repeat && event.key_code == KeyCode::Escape {
+        if !event.repeat && event.state.is_pressed() && event.key_code == KeyCode::Escape {
             ev.propagate(false);
             commands.trigger(RequestClose {
                 source: ev.event_target(),
