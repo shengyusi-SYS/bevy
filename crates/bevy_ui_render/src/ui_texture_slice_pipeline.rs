@@ -486,6 +486,7 @@ pub fn prepare_ui_slices(
     mut image_bind_groups: ResMut<UiTextureSliceImageBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    segments: Res<UiPassSegments>,
     events: Res<SpriteAssetEvents>,
     mut previous_len: Local<usize>,
 ) {
@@ -517,12 +518,15 @@ pub fn prepare_ui_slices(
         let mut vertices_index = 0;
         let mut indices_index = 0;
 
-        for ui_phase in phases.values_mut() {
+        for (view, ui_phase) in phases.iter_mut() {
             let mut batch_item_index = 0;
             let mut batch_image_handle = None;
             let mut batch_image_size = Vec2::ZERO;
 
             for item_index in 0..ui_phase.items.len() {
+                if segments.breaks_batch(*view, item_index) {
+                    batch_image_handle = None;
+                }
                 let item = &mut ui_phase.items[item_index];
                 if let Some(texture_slices) = extracted_slices
                     .slices

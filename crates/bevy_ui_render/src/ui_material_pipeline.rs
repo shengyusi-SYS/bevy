@@ -507,6 +507,7 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
     globals_buffer: Res<GlobalsBuffer>,
     ui_material_pipeline: Res<UiMaterialPipeline<M>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    segments: Res<UiPassSegments>,
     mut previous_len: Local<usize>,
 ) {
     if let (Some(view_binding), Some(globals_binding)) = (
@@ -523,11 +524,14 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
         ));
         let mut index = 0;
 
-        for ui_phase in phases.values_mut() {
+        for (view, ui_phase) in phases.iter_mut() {
             let mut batch_item_index = 0;
             let mut batch_shader_handle = None;
 
             for item_index in 0..ui_phase.items.len() {
+                if segments.breaks_batch(*view, item_index) {
+                    batch_shader_handle = None;
+                }
                 let item = &mut ui_phase.items[item_index];
                 if let Some(extracted_uinode) = extracted_uinodes
                     .uinodes

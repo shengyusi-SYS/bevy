@@ -1,4 +1,5 @@
 use core::ops::Range;
+use std::borrow::Cow;
 
 use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
 
@@ -9,6 +10,7 @@ use bevy_ecs::{
     system::{lifetimeless::*, SystemParamItem},
 };
 use bevy_math::FloatOrd;
+use bevy_platform::collections::HashMap;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -21,12 +23,80 @@ use bevy_render::{
 use indexmap::IndexMap;
 use tracing::error;
 
+/// GPU work executed between two UI render passes.
+///
+/// The entity is the UI view entity, whose [`UiViewTarget`] identifies the target
+/// camera. The callback can read prepared render-world data and record commands
+/// through the same [`RenderContext`] as the UI pass. No render pass is open
+/// during the callback. Resources used by a callback must be prepared before
+/// rendering; a callback cannot mutate ECS state.
+pub type UiPassCallback = fn(&World, Entity, &mut RenderContext<'_, '_>);
+
+struct UiPassSegment {
+    before_index: usize,
+    callback: Option<UiPassCallback>,
+}
+
+/// Per-frame UI batch boundaries and optional work between render passes.
+///
+/// Register boundaries after [`RenderSystems::PhaseSort`](bevy_render::RenderSystems::PhaseSort)
+/// and before [`RenderSystems::Prepare`](bevy_render::RenderSystems::Prepare).
+/// Indices refer to the sorted [`TransparentUi`] items, before batching. All
+/// native UI batchers preserve these boundaries. Requests are cleared during
+/// [`RenderSystems::Cleanup`](bevy_render::RenderSystems::Cleanup), so extensions
+/// must register the requests they need each frame.
+///
+/// This is a render-world resource; applications normally use it through a
+/// rendering plugin rather than changing their main-world UI nodes.
+#[derive(Resource, Default)]
+pub struct UiPassSegments {
+    views: HashMap<RetainedViewEntity, Vec<UiPassSegment>>,
+}
+
+impl UiPassSegments {
+    /// Prevents batching across `before_index` and optionally runs GPU work there.
+    ///
+    /// `before_index` must be in `0..=phase.items.len()`. A callback runs after all
+    /// earlier items have been drawn and before the item at this index. Requests
+    /// at the same index execute in registration order. With `None`, only batches
+    /// are split; rendering can continue in a single render pass.
+    pub fn add(
+        &mut self,
+        view: RetainedViewEntity,
+        before_index: usize,
+        callback: Option<UiPassCallback>,
+    ) {
+        let segments = self.views.entry(view).or_default();
+        let insertion = segments.partition_point(|segment| segment.before_index <= before_index);
+        segments.insert(
+            insertion,
+            UiPassSegment {
+                before_index,
+                callback,
+            },
+        );
+    }
+
+    pub(crate) fn breaks_batch(&self, view: RetainedViewEntity, before_index: usize) -> bool {
+        self.views.get(&view).is_some_and(|segments| {
+            segments
+                .binary_search_by_key(&before_index, |segment| segment.before_index)
+                .is_ok()
+        })
+    }
+}
+
+pub(crate) fn clear_ui_pass_segments(mut segments: ResMut<UiPassSegments>) {
+    segments.views.clear();
+}
+
 pub fn ui_pass(
     world: &World,
     view: ViewQuery<&UiCameraView>,
     ui_view_query: Query<(&ExtractedView, &UiViewTarget)>,
     ui_view_target_query: Query<(&ViewTarget, &ExtractedCamera)>,
     transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
+    segments: Res<UiPassSegments>,
     mut ctx: RenderContext,
 ) {
     let ui_camera_view = view.into_inner();
@@ -46,13 +116,86 @@ pub fn ui_pass(
         return;
     };
 
-    if transparent_phase.items.is_empty() {
+    let callbacks = segments
+        .views
+        .get(&extracted_view.retained_view_entity)
+        .into_iter()
+        .flatten()
+        .filter_map(|segment| {
+            segment
+                .callback
+                .map(|callback| (segment.before_index, callback))
+        });
+    let mut callbacks = callbacks.peekable();
+
+    // Keep the existing single-pass path for views without GPU callbacks,
+    // including those that only request batch boundaries.
+    if callbacks.peek().is_none() {
+        if transparent_phase.items.is_empty() {
+            return;
+        }
+        draw_ui_range(
+            world,
+            &mut ctx,
+            transparent_phase,
+            ui_view_entity,
+            target,
+            camera,
+            0..transparent_phase.items.len(),
+            "ui".into(),
+        );
         return;
     }
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
+    let span = diagnostics.time_span(ctx.command_encoder(), "ui");
+    let mut start = 0;
+    let mut segment_index = 0;
+    for (before_index, callback) in callbacks {
+        if start < before_index {
+            draw_ui_range(
+                world,
+                &mut ctx,
+                transparent_phase,
+                ui_view_entity,
+                target,
+                camera,
+                start..before_index,
+                format!("ui_segment_{segment_index}").into(),
+            );
+            segment_index += 1;
+        }
+        callback(world, ui_view_entity, &mut ctx);
+        start = before_index;
+    }
+    if start < transparent_phase.items.len() {
+        draw_ui_range(
+            world,
+            &mut ctx,
+            transparent_phase,
+            ui_view_entity,
+            target,
+            camera,
+            start..transparent_phase.items.len(),
+            format!("ui_segment_{segment_index}").into(),
+        );
+    }
+    span.end(ctx.command_encoder());
+}
 
+fn draw_ui_range(
+    world: &World,
+    ctx: &mut RenderContext,
+    phase: &SortedRenderPhase<TransparentUi>,
+    ui_view_entity: Entity,
+    target: &ViewTarget,
+    camera: &ExtractedCamera,
+    range: Range<usize>,
+    name: Cow<'static, str>,
+) {
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("ui"),
         color_attachments: &[Some(target.get_unsampled_color_attachment())],
@@ -61,13 +204,13 @@ pub fn ui_pass(
         occlusion_query_set: None,
         multiview_mask: None,
     });
-    let pass_span = diagnostics.pass_span(&mut render_pass, "ui");
+    let pass_span = diagnostics.pass_span(&mut render_pass, name);
 
     if let Some(viewport) = camera.viewport.as_ref() {
         render_pass.set_camera_viewport(viewport);
     }
 
-    if let Err(err) = transparent_phase.render(&mut render_pass, world, ui_view_entity) {
+    if let Err(err) = phase.render_range(&mut render_pass, world, ui_view_entity, range) {
         error!("Error encountered while rendering the ui phase {err:?}");
     }
 

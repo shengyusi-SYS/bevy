@@ -240,6 +240,7 @@ impl Plugin for UiRenderPlugin {
             .allow_ambiguous_resource::<ExtractedUiNodes>()
             .init_resource::<DrawFunctions<TransparentUi>>()
             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
+            .init_resource::<UiPassSegments>()
             .allow_ambiguous_resource::<ViewSortedRenderPhases<TransparentUi>>()
             .add_render_command::<TransparentUi, DrawUi>()
             .configure_sets(
@@ -291,6 +292,7 @@ impl Plugin for UiRenderPlugin {
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
                     prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
                     clear_batches.in_set(RenderSystems::Cleanup),
+                    clear_ui_pass_segments.in_set(RenderSystems::Cleanup),
                 ),
             )
             .add_systems(
@@ -2135,6 +2137,7 @@ pub fn prepare_uinodes(
     mut image_bind_groups: ResMut<ImageNodeBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    segments: Res<UiPassSegments>,
     events: Res<SpriteAssetEvents>,
     mut previous_len: Local<usize>,
 ) {
@@ -2166,11 +2169,14 @@ pub fn prepare_uinodes(
         let mut vertices_index = 0;
         let mut indices_index = 0;
 
-        for ui_phase in phases.values_mut() {
+        for (view, ui_phase) in phases.iter_mut() {
             let mut batch_item_index = 0;
             let mut batch_image_handle = None;
 
             for item_index in 0..ui_phase.items.len() {
+                if segments.breaks_batch(*view, item_index) {
+                    batch_image_handle = None;
+                }
                 let item = &mut ui_phase.items[item_index];
                 let Some(extracted_uinode) = extracted_uinodes
                     .uinodes
