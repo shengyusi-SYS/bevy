@@ -68,6 +68,7 @@ impl Plugin for BoxShadowPlugin {
                     Render,
                     (
                         queue_shadows.in_set(RenderSystems::Queue),
+                        clear_shadow_batch_bindings.in_set(RenderSystems::Cleanup),
                         (cache::prepare_masks, prepare_shadows)
                             .chain()
                             .in_set(RenderSystems::PrepareBindGroups),
@@ -698,6 +699,14 @@ pub fn prepare_shadows(
         ui_meta.indices.write_buffer(&render_device, &render_queue);
         *previous_len = batches.len();
         commands.try_insert_batch(batches);
+    }
+}
+
+// Retained shadow entities can stop being batch heads. Their old texture
+// bindings must not keep masks alive after the coverage cache evicts them.
+fn clear_shadow_batch_bindings(mut batches: Query<&mut UiShadowsBatch>) {
+    for mut batch in &mut batches {
+        batch.mask_bind_group = None;
     }
 }
 
