@@ -495,6 +495,16 @@ pub fn check_dir_light_mesh_visibility(
         }
     }
 
+    // All light/cascade cleanup above must still run, even when no mesh is
+    // visible. In that case there is nothing to mark, so avoid a deferred
+    // command and rebuilding its QueryState against every world archetype.
+    if defer_visible_entities_queue
+        .iter_mut()
+        .all(|queue| queue.is_empty())
+    {
+        return;
+    }
+
     // Defer marking view visibility so this system can run in parallel with check_point_light_mesh_visibility
     // TODO: use resource to avoid unnecessary memory alloc
     let mut defer_queue = mem::take(defer_visible_entities_queue.deref_mut());
@@ -797,4 +807,116 @@ pub fn get_shadow_lod_origin(
     };
 
     None
+}
+
+#[cfg(test)]
+mod directional_visibility_tests {
+    use super::*;
+
+    // Exercise the real system across populated and empty deferred queues.
+    // Shadow-off and hidden lights must still clear the previous cascades.
+    #[test]
+    fn empty_shadow_updates_preserve_cleanup_and_later_visibility() {
+        let mut app = App::new();
+        app.add_plugins(bevy_app::TaskPoolPlugin::default())
+            .add_systems(Update, check_dir_light_mesh_visibility);
+        let view = app.world_mut().spawn_empty().id();
+        let mesh = app
+            .world_mut()
+            .spawn((
+                Mesh3d::default(),
+                InheritedVisibility::VISIBLE,
+                ViewVisibility::HIDDEN,
+            ))
+            .id();
+        app.update(); // No lights: no deferred visibility work.
+        assert!(!app.world().get::<ViewVisibility>(mesh).unwrap().get());
+
+        let light = app
+            .world_mut()
+            .spawn((
+                DirectionalLight {
+                    shadow_maps_enabled: true,
+                    ..Default::default()
+                },
+                CascadesFrusta {
+                    frusta: [(view, vec![Frustum::default()])].into_iter().collect(),
+                },
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        app.update();
+        assert!(app.world().get::<ViewVisibility>(mesh).unwrap().get());
+        assert_eq!(
+            app.world()
+                .get::<CascadesVisibleEntities>(light)
+                .unwrap()
+                .entities[&view][0]
+                .entities,
+            vec![mesh]
+        );
+
+        app.world_mut()
+            .get_mut::<DirectionalLight>(light)
+            .unwrap()
+            .shadow_maps_enabled = false;
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert(ViewVisibility::HIDDEN);
+        app.update();
+        assert!(app
+            .world()
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .is_empty());
+        assert!(!app.world().get::<ViewVisibility>(mesh).unwrap().get());
+
+        app.world_mut()
+            .get_mut::<DirectionalLight>(light)
+            .unwrap()
+            .shadow_maps_enabled = true;
+        app.update();
+        assert!(!app
+            .world()
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .is_empty());
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert(ViewVisibility::HIDDEN);
+        app.world_mut()
+            .entity_mut(light)
+            .insert(ViewVisibility::HIDDEN);
+        app.update();
+        assert!(app
+            .world()
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .is_empty());
+        app.world_mut()
+            .entity_mut(light)
+            .insert(ViewVisibility::VISIBLE);
+        app.update();
+        assert!(app.world().get::<ViewVisibility>(mesh).unwrap().get());
+
+        app.world_mut()
+            .get_mut::<CascadesFrusta>(light)
+            .unwrap()
+            .frusta
+            .clear();
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert(ViewVisibility::HIDDEN);
+        app.update();
+        assert!(app
+            .world()
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .is_empty());
+        assert!(!app.world().get::<ViewVisibility>(mesh).unwrap().get());
+    }
 }
