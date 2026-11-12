@@ -79,8 +79,77 @@ pub fn ui_stack_system(
         ),
         With<ComputedStackIndex>,
     >,
-    mut update_query: Query<&mut ComputedStackIndex>,
+    mut indexes: ParamSet<(
+        Query<
+            Entity,
+            (
+                With<ComputedStackIndex>,
+                Or<(
+                    Changed<ComputedStackIndex>,
+                    Changed<Children>,
+                    Changed<ChildOf>,
+                    Added<GhostNode>,
+                    Changed<ZIndex>,
+                    Changed<GlobalZIndex>,
+                )>,
+            ),
+        >,
+        Query<&mut ComputedStackIndex>,
+    )>,
+    mut removed: (
+        RemovedComponents<ComputedStackIndex>,
+        RemovedComponents<Children>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<GhostNode>,
+        RemovedComponents<ZIndex>,
+        RemovedComponents<GlobalZIndex>,
+    ),
 ) {
+    // Drain every removal reader even if another input already requires a
+    // rebuild. Index removal also covers despawned nodes, which no longer
+    // match ui_children. Other removals only affect current UI members.
+    let removed_input = [
+        removed.0.read().count() != 0,
+        removed
+            .1
+            .read()
+            .filter(|entity| ui_children.contains(*entity))
+            .count()
+            != 0,
+        removed
+            .2
+            .read()
+            .filter(|entity| ui_children.contains(*entity))
+            .count()
+            != 0,
+        removed
+            .3
+            .read()
+            .filter(|entity| ui_children.contains(*entity))
+            .count()
+            != 0,
+        removed
+            .4
+            .read()
+            .filter(|entity| ui_children.contains(*entity))
+            .count()
+            != 0,
+        removed
+            .5
+            .read()
+            .filter(|entity| ui_children.contains(*entity))
+            .count()
+            != 0,
+    ]
+    .into_iter()
+    .any(|changed| changed);
+    // Tick filters still scan candidates, but stable geometry/visibility does
+    // not require walking, sorting, or rewriting the retained hierarchy.
+    // Keep this check inside the scheduled system so removals are consumed.
+    if !removed_input && !ui_stack.is_changed() && indexes.p0().is_empty() {
+        return;
+    }
+    let mut update_query = indexes.p1();
     let mut child_buffer = core::mem::take(&mut *local_cache)
         .into_iter()
         .map(|_| unreachable!())
@@ -233,7 +302,9 @@ fn update_uistack_recursive<'a>(
 
 #[cfg(test)]
 mod tests {
+    use bevy_camera::visibility::Visibility;
     use bevy_ecs::{
+        change_detection::DetectChanges,
         children,
         component::Component,
         hierarchy::ChildOf,
@@ -244,7 +315,175 @@ mod tests {
 
     use crate::{GhostNode, GlobalZIndex, Node, UiStack, ZIndex};
 
-    use super::ui_stack_system;
+    use super::{ui_stack_system, ComputedStackIndex};
+
+    fn maintenance_fixture() -> (World, Schedule) {
+        let mut world = World::default();
+        world.init_resource::<UiStack>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+        (world, schedule)
+    }
+
+    fn assert_stack(
+        world: &World,
+        nodes: &[bevy_ecs::entity::Entity],
+        partitions: &[core::ops::Range<usize>],
+    ) {
+        let stack = world.resource::<UiStack>();
+        assert_eq!(stack.uinodes, nodes);
+        assert_eq!(stack.partition, partitions);
+        for (index, &entity) in nodes.iter().enumerate() {
+            assert_eq!(
+                world.get::<ComputedStackIndex>(entity).unwrap().0,
+                index as u32
+            );
+        }
+    }
+
+    #[test]
+    fn ui_perf_stable_stack_preserves_output_change_ticks() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        let child = world.spawn((Node::default(), ChildOf(root))).id();
+        schedule.run(&mut world);
+        let stack_tick = world.get_resource_ref::<UiStack>().unwrap().last_changed();
+        let index_tick = world
+            .entity(child)
+            .get_ref::<ComputedStackIndex>()
+            .unwrap()
+            .last_changed();
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get_resource_ref::<UiStack>().unwrap().last_changed(),
+            stack_tick
+        );
+        // Geometry and visibility do not alter ordering, including keepalive
+        // hiding/revealing an existing tree.
+        world.entity_mut(child).insert(Visibility::Hidden);
+        world.get_mut::<Node>(child).unwrap().width = crate::Val::Px(40.0);
+        schedule.run(&mut world);
+        world.entity_mut(child).insert(Visibility::Visible);
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child], &[0..2]);
+        assert_eq!(
+            world.get_resource_ref::<UiStack>().unwrap().last_changed(),
+            stack_tick
+        );
+        assert_eq!(
+            world
+                .entity(child)
+                .get_ref::<ComputedStackIndex>()
+                .unwrap()
+                .last_changed(),
+            index_tick
+        );
+    }
+
+    #[test]
+    fn ui_perf_stack_tracks_reorder_reparent_and_detached_roots() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        let a = world.spawn((Node::default(), ChildOf(root))).id();
+        let b = world.spawn((Node::default(), ChildOf(root))).id();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, a, b], &[0..3]);
+        world.entity_mut(root).replace_children(&[b, a]);
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, b, a], &[0..3]);
+        world.entity_mut(a).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, b, a], &[0..2, 2..3]);
+        let other = world.spawn((Node::default(), GlobalZIndex(10))).id();
+        world.entity_mut(a).insert(ChildOf(other));
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, b, other, a], &[0..2, 2..4]);
+    }
+
+    #[test]
+    fn ui_perf_stack_tracks_index_membership_and_repairs_external_writes() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        // Membership follows ComputedStackIndex, even without Node.
+        let child = world
+            .spawn((ComputedStackIndex::default(), ChildOf(root)))
+            .id();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child], &[0..2]);
+        world.entity_mut(child).remove::<ComputedStackIndex>();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root], &[0..1]);
+        world.entity_mut(child).insert(ComputedStackIndex(99));
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child], &[0..2]);
+        world.get_mut::<ComputedStackIndex>(child).unwrap().0 = 42;
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child], &[0..2]);
+        world.despawn(child);
+        schedule.run(&mut world);
+        assert_stack(&world, &[root], &[0..1]);
+        world.despawn(root);
+        schedule.run(&mut world);
+        assert_stack(&world, &[], &[]);
+    }
+
+    #[test]
+    fn ui_perf_stack_tracks_dynamic_ghosts_and_root_promotion() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        let ghost = world.spawn((GhostNode, ChildOf(root))).id();
+        let child = world.spawn((Node::default(), ChildOf(ghost))).id();
+        let sibling = world.spawn((Node::default(), ChildOf(root))).id();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child, sibling], &[0..3]);
+        world.entity_mut(ghost).remove::<GhostNode>();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, ghost, child, sibling], &[0..4]);
+        world.entity_mut(ghost).insert(GhostNode);
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, child, sibling], &[0..3]);
+        world.entity_mut(ghost).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, sibling, child], &[0..2, 2..3]);
+    }
+
+    #[test]
+    fn ui_perf_stack_tracks_local_and_global_z_add_change_remove() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        let a = world.spawn((Node::default(), ChildOf(root))).id();
+        let b = world.spawn((Node::default(), ChildOf(root))).id();
+        schedule.run(&mut world);
+        world.entity_mut(a).insert(ZIndex(1));
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, b, a], &[0..3]);
+        world.get_mut::<ZIndex>(a).unwrap().0 = -1;
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, a, b], &[0..3]);
+        world.entity_mut(a).remove::<ZIndex>();
+        world.entity_mut(b).insert(GlobalZIndex(-1));
+        schedule.run(&mut world);
+        assert_stack(&world, &[b, root, a], &[0..1, 1..3]);
+        world.get_mut::<GlobalZIndex>(b).unwrap().0 = 2;
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, a, b], &[0..2, 2..3]);
+        world.entity_mut(b).remove::<GlobalZIndex>();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root, a, b], &[0..3]);
+    }
+
+    #[test]
+    fn ui_perf_stack_rebuilds_after_external_resource_reset() {
+        let (mut world, mut schedule) = maintenance_fixture();
+        let root = world.spawn(Node::default()).id();
+        schedule.run(&mut world);
+        *world.resource_mut::<UiStack>() = UiStack::default();
+        schedule.run(&mut world);
+        assert_stack(&world, &[root], &[0..1]);
+        world.insert_resource(UiStack::default());
+        schedule.run(&mut world);
+        assert_stack(&world, &[root], &[0..1]);
+    }
 
     #[derive(Component, PartialEq, Debug, Clone)]
     struct Label(&'static str);

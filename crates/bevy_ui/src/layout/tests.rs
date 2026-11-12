@@ -20,6 +20,38 @@ use bevy_utils::prelude::default;
 const TARGET_WIDTH: u32 = 1000;
 const TARGET_HEIGHT: u32 = 100;
 
+#[test]
+fn ui_perf_transient_cleanup_preserves_cached_geometry_and_change_ticks() {
+    let mut app = App::new();
+    app.add_plugins(TaskPoolPlugin::default());
+    app.add_systems(PostUpdate, clear_transient_dirty_flags);
+    let entity = app.world_mut().spawn(ComputedLayout::default()).id();
+    app.update();
+    let tick = app
+        .world()
+        .entity(entity)
+        .get_ref::<ComputedLayout>()
+        .unwrap()
+        .last_changed();
+    {
+        // Layout's internal writes deliberately bypass ECS change detection.
+        // A cleanup based only on Changed<ComputedLayout> would miss these.
+        let mut layout = app.world_mut().get_mut::<ComputedLayout>(entity).unwrap();
+        let layout = layout.bypass_change_detection();
+        layout.set_rounded(taffy::Layout::default());
+        layout.set_unrounded(taffy::Layout::default());
+        assert!(layout.layout_dirty());
+    }
+    app.update();
+    let entity = app.world().entity(entity);
+    let layout = entity.get_ref::<ComputedLayout>().unwrap();
+    assert!(layout.has_layout(), "cleanup must retain cached geometry");
+    assert!(!layout.layout_dirty());
+    assert!(!layout.self_dirty());
+    assert!(!layout.subtree_dirty());
+    assert_eq!(layout.last_changed(), tick);
+}
+
 fn setup_ui_test_app() -> App {
     let mut app = App::new();
     app.add_plugins(TaskPoolPlugin::default());

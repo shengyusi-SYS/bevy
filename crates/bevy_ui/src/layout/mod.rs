@@ -5,7 +5,7 @@ use crate::{
     IgnoreScroll, LayoutConfig, Node, Outline, OverflowAxis, OverrideClip, ScrollPosition,
 };
 use bevy_ecs::{
-    change_detection::{DetectChanges, DetectChangesMut},
+    change_detection::{DetectChanges, DetectChangesMut, Mut},
     component::Component,
     entity::{Entity, EntityHashSet},
     hierarchy::{ChildOf, Children},
@@ -145,13 +145,14 @@ pub enum LayoutError {
 ///
 /// Runs in `UiSystems::Prepare`
 pub fn clear_transient_dirty_flags(mut computed_layout_query: Query<&mut ComputedLayout>) {
-    computed_layout_query
-        .par_iter_mut()
-        .for_each(|mut computed_layout| {
-            computed_layout
-                .bypass_change_detection()
-                .clear_transient_dirty_flags();
-        });
+    // Three transient bits per node are cheaper to clear in this system than
+    // to dispatch as many tiny worker tasks. Internal layout writes bypass
+    // ECS change detection, so Changed<ComputedLayout> cannot select these.
+    for mut computed_layout in &mut computed_layout_query {
+        computed_layout
+            .bypass_change_detection()
+            .clear_transient_dirty_flags();
+    }
 }
 
 /// Updates the lists of root nodes.
@@ -241,33 +242,48 @@ pub fn sync_font_size_to_em_size(
 /// Runs in [`UiSystems::Layout`](`super::UiSystems::Layout`).
 pub fn sync_taffy_styles_with_nodes(
     rem_size: Res<RemSize>,
-    mut update_query: Query<(
-        Ref<Node>,
-        Ref<ComputedUiRenderTargetInfo>,
-        Ref<EmSize>,
-        &mut TaffyStyle,
-    )>,
+    changed: Query<
+        Entity,
+        (
+            With<TaffyStyle>,
+            Or<(
+                Changed<Node>,
+                Changed<ComputedUiRenderTargetInfo>,
+                Changed<EmSize>,
+            )>,
+        ),
+    >,
+    mut update_query: Query<(&Node, &ComputedUiRenderTargetInfo, &EmSize, &mut TaffyStyle)>,
 ) {
-    update_query
-        .par_iter_mut()
-        .for_each(|(node, target, em_size, mut taffy_style)| {
-            if node.is_changed()
-                || target.is_changed()
-                || em_size.is_changed()
-                || rem_size.is_changed()
-            {
-                convert::update_taffy_style_from_node(
-                    &node,
-                    &LayoutContext::new(
-                        target.scale_factor(),
-                        target.physical_size().as_vec2(),
-                        *em_size,
-                        *rem_size,
-                    ),
-                    &mut taffy_style,
-                );
+    let update = |(node, target, em_size, mut taffy_style): (
+        &Node,
+        &ComputedUiRenderTargetInfo,
+        &EmSize,
+        Mut<TaffyStyle>,
+    )| {
+        convert::update_taffy_style_from_node(
+            node,
+            &LayoutContext::new(
+                target.scale_factor(),
+                target.physical_size().as_vec2(),
+                *em_size,
+                *rem_size,
+            ),
+            &mut taffy_style,
+        );
+    };
+    if rem_size.is_changed() {
+        // A global unit change still requires all matching styles.
+        update_query.par_iter_mut().for_each(update);
+    } else {
+        // Usually no input changed. Visit output components only for the
+        // changed candidates, without dispatching a full parallel traversal.
+        for entity in &changed {
+            if let Ok(item) = update_query.get_mut(entity) {
+                update(item);
             }
-        });
+        }
+    }
 }
 
 /// Identify entities whose UI layout input components have been changed, added or removed.
