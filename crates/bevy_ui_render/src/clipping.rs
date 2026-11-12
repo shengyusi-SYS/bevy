@@ -30,7 +30,7 @@ pub fn clip_polygon<T: Copy>(
         return SmallVec::new();
     };
 
-    let mut visible_region = SmallVec::from_slice(vertices);
+    let mut visible_region: SmallVec<[(Vec2, T); INLINE_CAPACITY]> = SmallVec::from_slice(vertices);
     let mut scratch = SmallVec::new();
 
     for region in rects {
@@ -38,12 +38,28 @@ pub fn clip_polygon<T: Copy>(
             break;
         }
 
-        for (edge, distance_normal) in [
+        let edges = [
             (-region.rect.min.x, Vec2::X),
             (region.rect.max.x, Vec2::NEG_X),
             (region.rect.max.y, Vec2::NEG_Y),
             (-region.rect.min.y, Vec2::Y),
-        ] {
+        ];
+
+        // Most glyphs and quads are wholly within each ancestor clip. In that
+        // case no intersections can be introduced: transform each vertex once
+        // instead of traversing and copying the polygon for every finite edge.
+        // Keep the same distance comparisons and unbounded-edge semantics as
+        // edge_clip, including transformed clip regions.
+        if visible_region.iter().all(|vertex| {
+            let local = region.world_to_clip_local.transform_point2(vertex.0);
+            edges
+                .iter()
+                .all(|&(edge, normal)| !edge.is_finite() || 0. <= local.dot(normal) + edge)
+        }) {
+            continue;
+        }
+
+        for (edge, distance_normal) in edges {
             if edge.is_finite() {
                 edge_clip(
                     &visible_region,
@@ -130,6 +146,24 @@ mod tests {
     #[test]
     fn unclipped_quad_returns_all_vertices() {
         assert_eq!(clip_polygon(None, &quad(), Vec2::lerp).len(), 4);
+    }
+
+    #[test]
+    fn containing_transformed_clips_preserve_vertices_and_attributes() {
+        let clip = calculated_clip([
+            CalculatedClipRect {
+                rect: Rect::from_corners(vec2(-2., -2.), vec2(2., 2.)),
+                world_to_clip_local: Affine2::from_angle(0.5),
+            },
+            CalculatedClipRect {
+                rect: Rect::from_corners(vec2(-4., -4.), vec2(4., 4.)),
+                world_to_clip_local: Affine2::from_scale(Vec2::splat(2.)),
+            },
+        ]);
+        assert_eq!(
+            clip_polygon(Some(&clip), &quad(), Vec2::lerp).as_slice(),
+            &quad()
+        );
     }
 
     #[test]
