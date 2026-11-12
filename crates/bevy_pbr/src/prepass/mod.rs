@@ -740,6 +740,11 @@ pub fn prepare_previous_view_uniforms(
 ) {
     let views_iter = views.iter();
     let view_count = views_iter.len();
+    // A retained allocation is not evidence of a current consumer. Include
+    // ShadowView in the query above, and leave the allocation for reactivation.
+    if view_count == 0 {
+        return;
+    }
     let Some(mut writer) =
         previous_view_uniforms
             .uniforms

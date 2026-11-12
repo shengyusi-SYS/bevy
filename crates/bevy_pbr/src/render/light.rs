@@ -1127,6 +1127,30 @@ pub fn prepare_lights(
 ) {
     let views_iter = views.iter();
     let views_count = views_iter.len();
+    // Point/spot shadows are shared across cameras. Restrict this exit to
+    // the existing exact consumer and light queries all being empty; any
+    // remaining light continues through the complete preparation path.
+    if views_count == 0
+        && point_lights.is_empty()
+        && directional_lights.is_empty()
+        && rect_lights.is_empty()
+    {
+        global_clusterable_object_meta.entity_to_index.clear();
+        global_clusterable_object_meta.gpu_clustered_lights.clear();
+        live_shadow_mapping_lights.clear();
+        let live_views = EntityHashSet::default();
+        finish_light_preparation(
+            &mut commands,
+            &existing_shadow_views,
+            &mut directional_light_view_entities,
+            &live_views,
+            &live_shadow_mapping_lights,
+            &mut shadow_render_phases,
+            &mut light_key_cache,
+            &mut specialized_shadow_material_pipeline_cache,
+        );
+        return;
+    }
     let Some(mut view_gpu_lights_writer) =
         light_meta
             .view_gpu_lights
@@ -2105,20 +2129,44 @@ pub fn prepare_lights(
         ));
     }
 
+    finish_light_preparation(
+        &mut commands,
+        &existing_shadow_views,
+        &mut directional_light_view_entities,
+        &live_views,
+        &live_shadow_mapping_lights,
+        &mut shadow_render_phases,
+        &mut light_key_cache,
+        &mut specialized_shadow_material_pipeline_cache,
+    );
+}
+
+// Shared by the normal path and the empty-consumer path. Keep cleanup
+// independent of uniform allocation, which can remain cached while inactive.
+fn finish_light_preparation(
+    commands: &mut Commands,
+    existing_shadow_views: &Query<&ShadowView>,
+    directional_light_view_entities: &mut Query<&mut DirectionalLightViewEntities>,
+    live_views: &EntityHashSet,
+    live_shadow_mapping_lights: &HashSet<RetainedViewEntity>,
+    shadow_render_phases: &mut ViewBinnedRenderPhases<Shadow>,
+    light_key_cache: &mut LightKeyCache,
+    specialized_shadow_material_pipeline_cache: &mut SpecializedShadowMaterialPipelineCache,
+) {
     // Mark the existing shadow maps as unused this frame so that the first
     // drawcall to them will clear them.
-    for existing_shadow_view in &existing_shadow_views {
+    for existing_shadow_view in existing_shadow_views {
         existing_shadow_view
             .depth_attachment
             .prepare_for_new_frame();
     }
 
     // Despawn light-view entities for views that no longer exist
-    for mut entities in &mut directional_light_view_entities {
+    for mut entities in directional_light_view_entities.iter_mut() {
         for (_, light_view_entities) in
             entities.extract_if(|entity, _| !live_views.contains(entity))
         {
-            despawn_entities(&mut commands, light_view_entities);
+            despawn_entities(commands, light_view_entities);
         }
     }
 
@@ -3160,5 +3208,119 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod ui_performance_tests {
+    use super::*;
+    use bevy_ecs::system::SystemState;
+
+    #[test]
+    fn ui_perf_empty_light_consumers_clean_directional_state_and_keep_shared_views() {
+        // T1: real deferred cleanup, CPU phase/key caches and light-view
+        // identities. Depth attachment reset itself is the unchanged GPU path.
+        let mut world = World::default();
+        world.init_resource::<ViewBinnedRenderPhases<Shadow>>();
+        world.init_resource::<LightKeyCache>();
+        world.init_resource::<SpecializedShadowMaterialPipelineCache>();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let cascade_a = world.spawn_empty().id();
+        let cascade_b = world.spawn_empty().id();
+        let shared = world.spawn_empty().id();
+        let shared_owner = world
+            .spawn(PointAndSpotLightViewEntities(vec![shared]))
+            .id();
+        let light = world
+            .spawn(DirectionalLightViewEntities(EntityHashMap::from_iter([
+                (a, vec![cascade_a]),
+                (b, vec![cascade_b]),
+            ])))
+            .id();
+        let retained_a = RetainedViewEntity::new(a.into(), None, 0);
+        let retained_b = RetainedViewEntity::new(b.into(), None, 0);
+        for view in [retained_a, retained_b] {
+            world
+                .resource_mut::<ViewBinnedRenderPhases<Shadow>>()
+                .prepare_for_new_frame(view, GpuPreprocessingMode::None);
+            world
+                .resource_mut::<LightKeyCache>()
+                .insert(view, MeshPipelineKey::empty());
+            world
+                .resource_mut::<SpecializedShadowMaterialPipelineCache>()
+                .insert(view, Default::default());
+        }
+        let mut state: SystemState<(
+            Commands,
+            Query<&ShadowView>,
+            Query<&mut DirectionalLightViewEntities>,
+            ResMut<ViewBinnedRenderPhases<Shadow>>,
+            ResMut<LightKeyCache>,
+            ResMut<SpecializedShadowMaterialPipelineCache>,
+        )> = SystemState::new(&mut world);
+        for live in [true, false] {
+            let live_views = if live {
+                EntityHashSet::from_iter([a])
+            } else {
+                EntityHashSet::default()
+            };
+            let live_shadows = if live {
+                HashSet::from_iter([retained_a])
+            } else {
+                HashSet::default()
+            };
+            {
+                let (mut commands, shadows, mut maps, mut phases, mut keys, mut pipelines) =
+                    state.get_mut(&mut world).unwrap();
+                finish_light_preparation(
+                    &mut commands,
+                    &shadows,
+                    &mut maps,
+                    &live_views,
+                    &live_shadows,
+                    &mut phases,
+                    &mut keys,
+                    &mut pipelines,
+                );
+            }
+            state.apply(&mut world);
+            assert!(world.get_entity(cascade_b).is_err());
+            assert_eq!(world.get_entity(cascade_a).is_ok(), live);
+            let mapping = world.get::<DirectionalLightViewEntities>(light).unwrap();
+            assert_eq!(mapping.contains_key(&a), live);
+            assert!(!mapping.contains_key(&b));
+            assert_eq!(
+                world
+                    .resource::<ViewBinnedRenderPhases<Shadow>>()
+                    .contains_key(&retained_a),
+                live
+            );
+            assert_eq!(
+                world.resource::<LightKeyCache>().contains_key(&retained_a),
+                live
+            );
+            assert_eq!(
+                world
+                    .resource::<SpecializedShadowMaterialPipelineCache>()
+                    .contains_key(&retained_a),
+                live
+            );
+            assert!(!world
+                .resource::<ViewBinnedRenderPhases<Shadow>>()
+                .contains_key(&retained_b));
+            assert!(!world.resource::<LightKeyCache>().contains_key(&retained_b));
+            assert!(!world
+                .resource::<SpecializedShadowMaterialPipelineCache>()
+                .contains_key(&retained_b));
+            assert!(world.get_entity(shared).is_ok());
+            assert_eq!(
+                world
+                    .get::<PointAndSpotLightViewEntities>(shared_owner)
+                    .unwrap()
+                    .0,
+                [shared]
+            );
+        }
     }
 }

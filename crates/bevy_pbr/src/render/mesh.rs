@@ -878,6 +878,8 @@ pub struct RenderMeshInstanceSharedFlat {
     flags: RenderMeshInstanceFlags,
 }
 
+// The field DSL does not accept a trailing comma after a setter.
+#[rustfmt::skip]
 impl_atomic_pod!(
     RenderMeshInstanceSharedFlat,
     RenderMeshInstanceSharedFlatBlob,
@@ -1814,6 +1816,7 @@ pub fn extract_meshes_for_cpu_building(
     render_material_bindings: Res<RenderMaterialBindings>,
     render_visibility_ranges: Res<RenderVisibilityRanges>,
     mut render_mesh_instance_queues: Local<Parallel<Vec<(Entity, RenderMeshInstanceCpu)>>>,
+    mesh_visibility: Extract<Query<&ViewVisibility, (With<Mesh3d>, With<GlobalTransform>)>>,
     meshes_query: Extract<
         Query<(
             Entity,
@@ -1832,6 +1835,19 @@ pub fn extract_meshes_for_cpu_building(
         )>,
     >,
 ) {
+    // CPU extraction replaces the complete visible set each frame, including
+    // meshes made visible by shadow views. Keep that replacement semantics
+    // when retained meshes are all hidden, without dispatching empty jobs.
+    let RenderMeshInstances::CpuBuilding(ref mut instances) = *render_mesh_instances else {
+        panic!(
+            "`extract_meshes_for_cpu_building` should only be called if we're using CPU \
+            `MeshUniform` building"
+        );
+    };
+    instances.clear();
+    if !mesh_visibility.iter().any(|visibility| visibility.get()) {
+        return;
+    }
     meshes_query.par_iter().for_each_init(
         || render_mesh_instance_queues.borrow_local_mut(),
         |queue,
@@ -1904,18 +1920,9 @@ pub fn extract_meshes_for_cpu_building(
     );
 
     // Collect the render mesh instances.
-    let RenderMeshInstances::CpuBuilding(ref mut render_mesh_instances) = *render_mesh_instances
-    else {
-        panic!(
-            "`extract_meshes_for_cpu_building` should only be called if we're using CPU \
-            `MeshUniform` building"
-        );
-    };
-
-    render_mesh_instances.clear();
     for queue in render_mesh_instance_queues.iter_mut() {
         for (entity, render_mesh_instance) in queue.drain(..) {
-            render_mesh_instances.insert(entity.into(), render_mesh_instance);
+            instances.insert(entity.into(), render_mesh_instance);
         }
     }
 }
@@ -4001,6 +4008,7 @@ pub fn prepare_mesh_bind_groups(
     mesh_pipeline: Res<MeshPipeline>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
+    render_mesh_instances: Res<RenderMeshInstances>,
     cpu_batched_instance_buffer: Option<
         Res<no_gpu_preprocessing::BatchedInstanceBuffer<MeshUniform>>,
     >,
@@ -4021,6 +4029,21 @@ pub fn prepare_mesh_bind_groups(
             .into_inner()
             .instance_data_binding()
     {
+        // Every CPU phase obtains batch data from this frame's extracted
+        // instances. An empty set has no mesh consumer, even if the GPU buffer
+        // allocation and allocator slabs survived from a previous scene.
+        if matches!(&*render_mesh_instances, RenderMeshInstances::CpuBuilding(instances) if instances.is_empty())
+        {
+            match mesh_bind_groups.as_deref_mut() {
+                Some(MeshBindGroups::CpuPreprocessing(groups)) => groups.reset(),
+                _ => {
+                    commands.insert_resource(MeshBindGroups::CpuPreprocessing(
+                        MeshPhaseBindGroups::new(&render_device),
+                    ));
+                }
+            }
+            return;
+        }
         // Reuse allocations
         let mut cpu_preprocessing_mesh_bind_groups = match mesh_bind_groups.as_deref_mut() {
             None | Some(MeshBindGroups::GpuPreprocessing(_)) => {
@@ -4877,6 +4900,88 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{AtomicU64ZeroBitIter, MeshPipelineKey};
+
+    #[test]
+    fn ui_perf_cpu_mesh_extraction_replaces_hidden_and_reappearing_instances() {
+        // T1: visibility is the input boundary shared by camera and shadow
+        // culling. Exercise the real Extract system without a GPU device.
+        use super::*;
+        use bevy_ecs::schedule::Schedule;
+        use bevy_render::MainWorld;
+        ComputeTaskPool::get_or_init(bevy_tasks::TaskPool::new);
+        let mut world = World::default();
+        world.init_resource::<MainWorld>();
+        world.insert_resource(RenderMeshInstances::new(false));
+        world.init_resource::<RenderMaterialInstances>();
+        world.init_resource::<RenderMaterialBindings>();
+        world.init_resource::<RenderVisibilityRanges>();
+        let a = world
+            .resource_mut::<MainWorld>()
+            .spawn((Mesh3d::default(), ViewVisibility::VISIBLE))
+            .id();
+        let b = world
+            .resource_mut::<MainWorld>()
+            .spawn((Mesh3d::default(), ViewVisibility::VISIBLE))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(extract_meshes_for_cpu_building);
+        schedule.run(&mut world);
+        let RenderMeshInstances::CpuBuilding(instances) = world.resource::<RenderMeshInstances>()
+        else {
+            panic!("CPU fixture")
+        };
+        assert_eq!(instances.len(), 2);
+        assert!(
+            instances.contains_key(&MainEntity::from(a))
+                && instances.contains_key(&MainEntity::from(b))
+        );
+
+        for entity in [a, b] {
+            world
+                .resource_mut::<MainWorld>()
+                .entity_mut(entity)
+                .insert(ViewVisibility::HIDDEN);
+        }
+        schedule.run(&mut world);
+        let RenderMeshInstances::CpuBuilding(instances) = world.resource::<RenderMeshInstances>()
+        else {
+            panic!("CPU fixture")
+        };
+        assert!(
+            instances.is_empty(),
+            "hidden meshes must retire the previous complete set"
+        );
+
+        let layers = RenderLayers::layer(7);
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(b)
+            .insert((ViewVisibility::VISIBLE, layers.clone()));
+        schedule.run(&mut world);
+        let RenderMeshInstances::CpuBuilding(instances) = world.resource::<RenderMeshInstances>()
+        else {
+            panic!("CPU fixture")
+        };
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances
+                .get(&MainEntity::from(b))
+                .unwrap()
+                .render_layers
+                .as_ref(),
+            Some(&layers)
+        );
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(b)
+            .remove::<Mesh3d>();
+        schedule.run(&mut world);
+        let RenderMeshInstances::CpuBuilding(instances) = world.resource::<RenderMeshInstances>()
+        else {
+            panic!("CPU fixture")
+        };
+        assert!(instances.is_empty());
+    }
 
     #[test]
     fn mesh_key_msaa_samples() {

@@ -740,6 +740,9 @@ fn mark_meshes_as_changed_if_their_materials_changed<M>(
 ) where
     M: Material,
 {
+    if changed_meshes_query.is_empty() {
+        return;
+    }
     changed_meshes_query.par_iter_mut().for_each(|mut mesh| {
         mesh.set_changed();
     });
@@ -933,10 +936,12 @@ pub fn check_entities_needing_specialization<M>(
     entities_needing_specialization.removed.clear();
 
     // Gather all entities that need their specializations regenerated.
-    needs_specialization
-        .par_iter()
-        .for_each(|entity| par_local.borrow_local_mut().push(entity));
-    par_local.drain_into(&mut entities_needing_specialization.changed);
+    if !needs_specialization.is_empty() {
+        needs_specialization
+            .par_iter()
+            .for_each(|entity| par_local.borrow_local_mut().push(entity));
+        par_local.drain_into(&mut entities_needing_specialization.changed);
+    }
 
     // All entities that removed their `Mesh3d` or `MeshMaterial3d` components
     // need to have their specializations removed as well.
@@ -1842,5 +1847,115 @@ impl MaterialPropertiesExt for MaterialProperties {
         // So we have to disable the optimization for depth only prepass and always bind the material's bind group.
         self.get_shader(PrepassVertexShader).is_some()
             || self.get_shader(PrepassFragmentShader).is_some()
+    }
+}
+
+#[cfg(test)]
+mod ui_performance_tests {
+    use super::*;
+    use bevy_app::{App, TaskPoolPlugin};
+    use bevy_asset::{
+        io::{
+            memory::{Dir, MemoryAssetReader},
+            AssetSourceBuilder, AssetSourceId,
+        },
+        AssetApp, AssetPlugin, Assets,
+    };
+    use bevy_mesh::Mesh;
+
+    #[test]
+    fn ui_perf_material_specialization_preserves_asset_changes_and_removals() {
+        // T2: real asset event tracking -> MaterialPlugin qualification. No
+        // RenderApp, renderer, filesystem source, or GPU is substituted here.
+        let mut app = App::new();
+        let dir = Dir::default();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: dir.clone() })),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin {
+                watch_for_changes_override: Some(false),
+                use_asset_processor_override: Some(false),
+                ..Default::default()
+            },
+        ));
+        app.init_asset::<Mesh>()
+            .add_plugins(MaterialPlugin::<StandardMaterial>::default());
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let entity = app
+            .world_mut()
+            .spawn((Mesh3d::default(), MeshMaterial3d(material.clone())))
+            .id();
+        app.update();
+        let state = app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>();
+        assert_eq!(state.changed, [entity]);
+        assert!(state.removed.is_empty());
+        app.update();
+        app.update();
+        let state = app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>();
+        assert!(state.changed.is_empty() && state.removed.is_empty());
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .perceptual_roughness = 0.123;
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<EntitiesNeedingSpecialization<StandardMaterial>>()
+                .changed,
+            [entity]
+        );
+        app.update();
+        app.update();
+        assert!(app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>()
+            .changed
+            .is_empty());
+
+        app.world_mut()
+            .entity_mut(entity)
+            .remove::<MeshMaterial3d<StandardMaterial>>();
+        app.update();
+        let state = app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>();
+        assert!(state.changed.is_empty());
+        assert_eq!(
+            state.removed,
+            [entity],
+            "an empty changed query must still deliver removals"
+        );
+        app.update();
+        assert!(app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>()
+            .removed
+            .is_empty());
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(MeshMaterial3d(material));
+        app.world_mut().entity_mut(entity).remove::<Mesh3d>();
+        app.world_mut().entity_mut(entity).insert(Mesh3d::default());
+        app.update();
+        let state = app
+            .world()
+            .resource::<EntitiesNeedingSpecialization<StandardMaterial>>();
+        assert_eq!(state.changed, [entity]);
+        assert_eq!(
+            state.removed,
+            [entity],
+            "remove and readd remains removals-before-additions input"
+        );
     }
 }
