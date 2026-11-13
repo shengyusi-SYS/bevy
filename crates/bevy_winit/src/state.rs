@@ -96,15 +96,27 @@ pub(crate) struct WinitAppRunnerState {
             ),
         >,
     >,
+    // These are used on every event-loop iteration, including iterations that
+    // do not update the app. Retain Bevy's query/access metadata, while get/get_mut
+    // continue to observe new archetypes and the current resource values.
+    create_monitor_system_state: SystemState<CreateMonitorParams<'static, 'static>>,
+    window_update_mode_state: SystemState<WindowUpdateModeParams>,
     /// time at which next tick is scheduled to run when `update_mode` is [`UpdateMode::Reactive`]
     scheduled_tick_start: Option<Instant>,
 }
+
+type WindowUpdateModeParams = (
+    Res<'static, WinitSettings>,
+    Query<'static, 'static, (Entity, &'static Window)>,
+);
 
 impl WinitAppRunnerState {
     fn new(mut app: App) -> Self {
         let windows_system_state: SystemState<
             Query<(&mut Window, &mut CachedWindow, &mut WinitWindowPressedKeys)>,
         > = SystemState::new(app.world_mut());
+        let create_monitor_system_state = SystemState::new(app.world_mut());
+        let window_update_mode_state = SystemState::new(app.world_mut());
 
         Self {
             app,
@@ -124,6 +136,8 @@ impl WinitAppRunnerState {
             raw_winit_events: Vec::new(),
             pending_modifiers: Vec::new(),
             windows_system_state,
+            create_monitor_system_state,
+            window_update_mode_state,
             scheduled_tick_start: None,
         }
     }
@@ -475,12 +489,13 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let mut create_monitor = SystemState::<CreateMonitorParams>::from_world(self.world_mut());
         create_monitors(
             event_loop,
-            create_monitor.get_mut(self.world_mut()).unwrap(),
+            self.create_monitor_system_state
+                .get_mut(self.app.world_mut())
+                .unwrap(),
         );
-        create_monitor.apply(self.world_mut());
+        self.create_monitor_system_state.apply(self.app.world_mut());
 
         // TODO: This is a workaround for https://github.com/bevyengine/bevy/issues/17488
         //       while preserving the iOS fix in https://github.com/bevyengine/bevy/pull/11245
@@ -533,10 +548,7 @@ impl WinitAppRunnerState {
         let mut redraw_message_cursor = MessageCursor::<RequestRedraw>::default();
         let mut close_message_cursor = MessageCursor::<WindowCloseRequested>::default();
 
-        let mut focused_windows_state: SystemState<(Res<WinitSettings>, Query<(Entity, &Window)>)> =
-            SystemState::new(self.world_mut());
-
-        let (config, windows) = focused_windows_state.get(self.world()).unwrap();
+        let (config, windows) = self.window_update_mode_state.get(self.app.world()).unwrap();
         let focused = windows.iter().any(|(_, window)| window.focused);
 
         let mut update_mode = config.update_mode(focused);
@@ -626,7 +638,7 @@ impl WinitAppRunnerState {
         let begin_frame_time = Instant::now();
 
         if should_update {
-            let (_, windows) = focused_windows_state.get(self.world()).unwrap();
+            let (_, windows) = self.window_update_mode_state.get(self.app.world()).unwrap();
             // If no windows exist, this will evaluate to `true`.
             let all_invisible = windows.iter().all(|w| !w.1.visible);
 
@@ -669,7 +681,7 @@ impl WinitAppRunnerState {
             }
 
             // Running the app may have changed the WinitSettings resource, so we have to re-extract it.
-            let (config, windows) = focused_windows_state.get(self.world()).unwrap();
+            let (config, windows) = self.window_update_mode_state.get(self.app.world()).unwrap();
             let focused = windows.iter().any(|(_, window)| window.focused);
             update_mode = config.update_mode(focused);
         }
