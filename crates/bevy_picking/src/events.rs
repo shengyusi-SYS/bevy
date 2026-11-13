@@ -65,6 +65,18 @@ use crate::{
     pointer::{Location, PointerAction, PointerButton, PointerId, PointerInput, PointerMap},
     PickingSettings,
 };
+
+/// Optional application policy evaluated immediately before a click is dispatched.
+///
+/// The predicate observes state written by earlier pointer observers, including when
+/// multiple inputs are processed in one frame. Returning `false` suppresses both
+/// the click's observers and message, without suppressing release or drag events.
+/// Without this resource, pointer events retain their default dispatch behavior.
+/// With it, accepted click messages are written at dispatch, before their observers.
+/// The predicate must remain a short, read-only eligibility check.
+#[derive(Resource, Clone, Copy)]
+pub struct PointerClickFilter(pub fn(&World, &PointerClick) -> bool);
+
 ///
 /// Stores the common data needed for all pointer events.
 ///
@@ -823,6 +835,7 @@ pub fn pointer_events(
     hover_map: Res<HoverMap>,
     previous_hover_map: Res<PreviousHoverMap>,
     picking_settings: Res<PickingSettings>,
+    click_filter: Option<Res<PointerClickFilter>>,
     mut pointer_state: ResMut<PointerState>,
     mut hovered_entity_ancestors: Local<HoveredEntityAncestors>,
     mut sent_leave: Local<HashSet<(PointerId, Entity)>>,
@@ -1112,8 +1125,18 @@ pub fn pointer_events(
                             duration: now - *press_instant,
                             count,
                         };
-                        commands.trigger(click_event.clone());
-                        message_writers.click_events.write(click_event);
+                        if let Some(filter) = &click_filter {
+                            let predicate = filter.0;
+                            commands.queue(move |world: &mut World| {
+                                if predicate(world, &click_event) {
+                                    world.write_message(click_event.clone());
+                                    world.trigger(click_event);
+                                }
+                            });
+                        } else {
+                            commands.trigger(click_event.clone());
+                            message_writers.click_events.write(click_event);
+                        }
                     }
                     // Always send the Release event
                     let released_event = PointerRelease {
@@ -1509,6 +1532,81 @@ mod tests {
                     "seed_previous_hover={seed_previous_hover}, separate_frames={separate_frames}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn click_filter_controls_both_channels_at_dispatch() {
+        #[derive(Resource, Default)]
+        struct Observations {
+            clicks: usize,
+            releases: usize,
+            allow: bool,
+        }
+
+        for mode in 0..3 {
+            let mut app = App::new();
+            initialize_app_for_test(&mut app);
+            app.init_resource::<Observations>();
+            app.add_observer(
+                |_: On<PointerClick>,
+                 mut seen: ResMut<Observations>,
+                 messages: Res<Messages<PointerClick>>| {
+                    assert!(
+                        !messages.is_empty(),
+                        "accepted message precedes its observer"
+                    );
+                    seen.clicks += 1;
+                },
+            );
+            app.add_observer(|_: On<PointerRelease>, mut seen: ResMut<Observations>| {
+                seen.releases += 1
+            });
+            if mode == 1 {
+                app.insert_resource(PointerClickFilter(|_, _| false));
+            } else if mode == 2 {
+                app.insert_resource(PointerClickFilter(|world, _| {
+                    world.resource::<Observations>().allow
+                }));
+                app.add_observer(|_: On<PointerPress>, mut seen: ResMut<Observations>| {
+                    seen.allow = true
+                });
+            }
+            let camera = app.world_mut().spawn(Camera::default()).id();
+            let target = app.world_mut().spawn_empty().id();
+            update_hover_map_with_hovered_entities(&mut app, camera, &[target]);
+            let moved = Location {
+                position: STUB_LOCATION.position + Vec2::splat(20.),
+                ..STUB_LOCATION
+            };
+            for (action, location) in [
+                (PointerAction::Press(PointerButton::Primary), STUB_LOCATION),
+                (
+                    PointerAction::Move {
+                        delta: Vec2::splat(20.),
+                    },
+                    moved.clone(),
+                ),
+                (PointerAction::Release(PointerButton::Primary), moved),
+            ] {
+                app.world_mut()
+                    .write_message(PointerInput::new(POINTER_ID, location, action));
+            }
+            app.world_mut().run_system_cached(pointer_events).unwrap();
+            let expected = usize::from(mode != 1);
+            assert_eq!(
+                app.world().resource::<Observations>().clicks,
+                expected,
+                "mode={mode}"
+            );
+            assert_eq!(
+                app.world().resource::<Messages<PointerClick>>().len(),
+                expected,
+                "mode={mode}"
+            );
+            assert_eq!(app.world().resource::<Observations>().releases, 1);
+            assert_eq!(app.world().resource::<Messages<PointerRelease>>().len(), 1);
+            assert_eq!(app.world().resource::<Messages<PointerDragEnd>>().len(), 1);
         }
     }
 
