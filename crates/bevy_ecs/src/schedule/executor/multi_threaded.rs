@@ -5,10 +5,7 @@ use bevy_tasks::{ComputeTaskPool, Scope, TaskPool, ThreadExecutor};
 use concurrent_queue::ConcurrentQueue;
 use core::{any::Any, panic::AssertUnwindSafe};
 use fixedbitset::FixedBitSet;
-use std::{
-    sync::{Mutex, MutexGuard},
-    thread::{self, ThreadId},
-};
+use std::sync::{Mutex, MutexGuard};
 
 #[cfg(feature = "trace")]
 use tracing::{info_span, Span};
@@ -148,7 +145,6 @@ struct Context<'scope, 'env, 'sys> {
     environment: &'env Environment<'env, 'sys>,
     scope: &'scope Scope<'scope, 'env, ()>,
     error_handler: ErrorHandler,
-    scope_thread: Option<ThreadId>,
 }
 
 impl Default for MultiThreadedExecutor {
@@ -290,7 +286,6 @@ impl SystemExecutor for MultiThreadedExecutor {
                     environment,
                     scope,
                     error_handler,
-                    scope_thread: self.scope_thread_execution.then(|| thread::current().id()),
                 };
 
                 // The first tick won't need to process finished systems, but we still need to run the loop in
@@ -401,7 +396,8 @@ impl MultiThreadedExecutor {
     /// Allows otherwise worker-bound systems to run on the schedule's calling thread.
     ///
     /// Disabled by default. When enabled, a `Send` system starting an idle execution
-    /// frontier on that thread may use the scope executor. Other systems remain
+    /// frontier may use the scope executor, including when a worker completes
+    /// the last running system. Other systems remain
     /// available to workers, so non-conflicting systems can still run in parallel.
     /// This may reduce handoffs for schedules with short, serialized systems, but
     /// can delay other work serviced by the calling thread when systems run for longer.
@@ -744,13 +740,10 @@ impl ExecutorState {
         };
 
         if is_send {
-            if self.num_running_systems == 1
-                && context
-                    .scope_thread
-                    .is_some_and(|caller| caller == thread::current().id())
+            if self.num_running_systems == 1 && context.environment.executor.scope_thread_execution
             {
-                // Only enqueue while holding the scheduling mutex. The existing
-                // scope executor polls the task after the mutex has been released.
+                // Enqueueing does not poll this task inline. Completion is
+                // coordinated by the existing scheduling mutex and completion queue.
                 context.scope.spawn_on_scope(task);
             } else {
                 context.scope.spawn(task);
@@ -1188,6 +1181,72 @@ mod tests {
                 .unwrap()
                 .is_some_and(|thread| thread != caller));
         }
+    }
+
+    // T1: readiness is advanced by the last worker after a false condition.
+    // The caller is available and the remaining Send work belongs to its scope.
+    #[test]
+    fn scope_thread_execution_reclaims_worker_ready_frontier() {
+        use crate::schedule::SystemSet;
+        use std::{
+            sync::{mpsc, Arc, Mutex},
+            thread,
+            time::Duration,
+        };
+
+        #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+        struct Root(usize);
+        #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+        struct Gate(usize);
+
+        let caller = thread::current().id();
+        let (a_tx, a_rx) = mpsc::channel();
+        let (b_tx, b_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let completed_rx = Arc::new(Mutex::new(completed_rx));
+        let make_root = |send: mpsc::Sender<()>, receive: mpsc::Receiver<()>| {
+            let receive = Mutex::new(receive);
+            let completed_rx = completed_rx.clone();
+            move || {
+                send.send(()).unwrap();
+                receive
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap();
+                if thread::current().id() != caller {
+                    completed_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap();
+                }
+            }
+        };
+        let condition = || {
+            let completed_tx = completed_tx.clone();
+            move || {
+                // A condition after the caller root can only run once that root
+                // is marked complete. The other root therefore completes last.
+                completed_tx.send(()).unwrap();
+                false
+            }
+        };
+        let observed = Arc::new(Mutex::new(None));
+        let record = observed.clone();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
+        schedule.add_systems((
+            make_root(a_tx, b_rx).in_set(Root(0)),
+            make_root(b_tx, a_rx).in_set(Root(1)),
+            (|| {}).run_if(condition()).after(Root(0)).in_set(Gate(0)),
+            (|| {}).run_if(condition()).after(Root(1)).in_set(Gate(1)),
+            (move || *record.lock().unwrap() = Some(thread::current().id()))
+                .after(Gate(0))
+                .after(Gate(1)),
+        ));
+        schedule.run(&mut World::new());
+        assert_eq!(*observed.lock().unwrap(), Some(caller));
     }
 
     #[test]
