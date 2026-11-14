@@ -6,7 +6,11 @@ use std::{
 };
 
 use crate::executor::FallibleTask;
-use bevy_platform::sync::Arc;
+use atomic_waker::AtomicWaker;
+use bevy_platform::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::FutureExt;
 
@@ -23,6 +27,75 @@ impl Drop for CallOnDrop {
         if let Some(call) = self.0.as_ref() {
             call();
         }
+    }
+}
+
+/// Notifies the scope caller when all registered tasks have completed, or when
+/// a task fails and the original result-collection path must propagate its panic.
+#[derive(Debug)]
+struct ScopeCompletion {
+    // The initial registration keeps the scope open until its closure returns.
+    remaining: AtomicUsize,
+    panicked: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl ScopeCompletion {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(1),
+            panicked: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn register(&self) -> ScopeTaskCompletion<'_> {
+        self.remaining.fetch_add(1, Ordering::Relaxed);
+        ScopeTaskCompletion {
+            completion: self,
+            panicked: true,
+        }
+    }
+
+    fn finish(&self, panicked: bool) {
+        if panicked {
+            self.panicked.store(true, Ordering::Release);
+        }
+        let last = self.remaining.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last || panicked {
+            self.waker.wake();
+        }
+    }
+
+    async fn wait(&self) {
+        core::future::poll_fn(|cx| {
+            self.waker.register(cx.waker());
+            if self.remaining.load(Ordering::Acquire) == 0 || self.panicked.load(Ordering::Acquire)
+            {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+struct ScopeTaskCompletion<'a> {
+    completion: &'a ScopeCompletion,
+    // Dropping an unfinished future must also unblock panic/cancellation cleanup.
+    panicked: bool,
+}
+
+impl ScopeTaskCompletion<'_> {
+    fn finish(mut self, panicked: bool) {
+        self.panicked = panicked;
+    }
+}
+
+impl Drop for ScopeTaskCompletion<'_> {
+    fn drop(&mut self) {
+        self.completion.finish(self.panicked);
     }
 }
 
@@ -399,11 +472,18 @@ impl TaskPool {
             FallibleTask<Result<T, Box<dyn core::any::Any + Send>>>,
         > = unsafe { mem::transmute(&spawned) };
 
+        let completion = ScopeCompletion::new();
+        // SAFETY: As with `spawned`, Scope::drop cancels and joins every task
+        // before this state is dropped. The completion signal never replaces
+        // joining the actual task handles.
+        let completion: &'env ScopeCompletion = unsafe { mem::transmute(&completion) };
+
         let scope = Scope {
             executor,
             external_executor,
             scope_executor,
             spawned,
+            completion,
             scope: PhantomData,
             env: PhantomData,
         };
@@ -413,12 +493,14 @@ impl TaskPool {
         let scope: &'env Scope<'_, 'env, T> = unsafe { mem::transmute(&scope) };
 
         f(scope);
+        completion.finish(false);
 
         if spawned.is_empty() {
             Vec::new()
         } else {
             block_on(async move {
                 let get_results = async {
+                    completion.wait().await;
                     let mut results = Vec::with_capacity(spawned.len());
                     while let Ok(task) = spawned.pop() {
                         if let Some(res) = task.await {
@@ -636,6 +718,7 @@ pub struct Scope<'scope, 'env: 'scope, T> {
     external_executor: &'scope ThreadExecutor<'scope>,
     scope_executor: &'scope ThreadExecutor<'scope>,
     spawned: &'scope ConcurrentQueue<FallibleTask<Result<T, Box<dyn core::any::Any + Send>>>>,
+    completion: &'scope ScopeCompletion,
     // make `Scope` invariant over 'scope and 'env
     scope: PhantomData<&'scope mut &'scope ()>,
     env: PhantomData<&'env mut &'env ()>,
@@ -651,9 +734,14 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     ///
     /// For more information, see [`TaskPool::scope`].
     pub fn spawn<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
+        let completion = self.completion.register();
         let task = self
             .executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(async move {
+                let result = AssertUnwindSafe(f).catch_unwind().await;
+                completion.finish(result.is_err());
+                result
+            })
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -667,9 +755,14 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     ///
     /// For more information, see [`TaskPool::scope`].
     pub fn spawn_on_scope<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
+        let completion = self.completion.register();
         let task = self
             .scope_executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(async move {
+                let result = AssertUnwindSafe(f).catch_unwind().await;
+                completion.finish(result.is_err());
+                result
+            })
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -684,9 +777,14 @@ impl<'scope, 'env, T: Send + 'scope> Scope<'scope, 'env, T> {
     ///
     /// For more information, see [`TaskPool::scope`].
     pub fn spawn_on_external<Fut: Future<Output = T> + 'scope + Send>(&self, f: Fut) {
+        let completion = self.completion.register();
         let task = self
             .external_executor
-            .spawn(AssertUnwindSafe(f).catch_unwind())
+            .spawn(async move {
+                let result = AssertUnwindSafe(f).catch_unwind().await;
+                completion.finish(result.is_err());
+                result
+            })
             .fallible();
         // ConcurrentQueue only errors when closed or full, but we never
         // close and use an unbounded queue, so it is safe to unwrap
@@ -711,7 +809,141 @@ where
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-    use std::sync::Barrier;
+    use std::{sync::Barrier, task::Wake};
+
+    #[derive(Default)]
+    struct CountWake(AtomicI32);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn scope_completion_coalesces_successful_tasks() {
+        let completion = ScopeCompletion::new();
+        let first = completion.register();
+        let last = completion.register();
+        completion.finish(false);
+        let counter = Arc::new(CountWake::default());
+        let waker = counter.clone().into();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut wait = core::pin::pin!(completion.wait());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        first.finish(false);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        last.finish(false);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert!(wait.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn scope_completion_keeps_initial_registration_open() {
+        let completion = ScopeCompletion::new();
+        completion.register().finish(false);
+        let counter = Arc::new(CountWake::default());
+        let waker = counter.clone().into();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut wait = core::pin::pin!(completion.wait());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        completion.finish(false);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert!(wait.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn scope_completion_panic_unblocks_before_other_tasks() {
+        let completion = ScopeCompletion::new();
+        let failed = completion.register();
+        let pending = completion.register();
+        completion.finish(false);
+        let counter = Arc::new(CountWake::default());
+        let waker = counter.clone().into();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut wait = core::pin::pin!(completion.wait());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        failed.finish(true);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert!(wait.as_mut().poll(&mut context).is_ready());
+        pending.finish(false);
+    }
+
+    #[test]
+    fn scope_completion_unfinished_drop_unblocks_cleanup() {
+        let completion = ScopeCompletion::new();
+        let cancelled = completion.register();
+        let pending = completion.register();
+        completion.finish(false);
+        let counter = Arc::new(CountWake::default());
+        let waker = counter.clone().into();
+        let mut context = core::task::Context::from_waker(&waker);
+        let mut wait = core::pin::pin!(completion.wait());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        drop(cancelled);
+        assert!(wait.as_mut().poll(&mut context).is_ready());
+        pending.finish(false);
+    }
+
+    #[test]
+    fn scope_panic_cancels_pending_borrowed_future() {
+        struct OnDrop<'a>(&'a AtomicBool);
+        impl Drop for OnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let pool = TaskPoolBuilder::new().num_threads(2).build();
+        let dropped = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            pool.scope(|scope| {
+                scope.spawn(async { panic!("scoped task failure") });
+                let on_drop = OnDrop(&dropped);
+                scope.spawn(async move {
+                    let _on_drop = on_drop;
+                    core::future::pending::<()>().await;
+                });
+            });
+        }));
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn scope_zero_workers_preserves_global_fallback_and_order() {
+        // The builder enforces at least two workers under cfg(test), so build
+        // the actual zero-worker state here without changing production APIs.
+        let (shutdown_tx, _shutdown_rx) = async_channel::unbounded();
+        let pool = TaskPool {
+            executor: Arc::new(crate::executor::Executor::new()),
+            threads: Vec::new(),
+            shutdown_tx,
+        };
+        assert!(pool.threads.is_empty());
+        for tick_global in [false, true] {
+            let outputs = pool.scope_with_executor(tick_global, None, |scope| {
+                scope.spawn(async { 1 });
+                scope.spawn_on_scope(async { 2 });
+                scope.spawn_on_external(async { 3 });
+            });
+            assert_eq!(outputs, [1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn scope_preserves_external_and_scope_thread_affinity() {
+        let pool = TaskPoolBuilder::new().num_threads(2).build();
+        let external = ThreadExecutor::new();
+        let caller = thread::current().id();
+        for tick_global in [false, true] {
+            let outputs = pool.scope_with_executor(tick_global, Some(&external), |scope| {
+                scope.spawn_on_scope(async { thread::current().id() });
+                scope.spawn_on_external(async { thread::current().id() });
+            });
+            assert_eq!(outputs, [caller, caller]);
+        }
+    }
 
     #[test]
     fn test_spawn() {
