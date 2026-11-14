@@ -27,6 +27,8 @@ use crate::{prelude::DetectChanges, HotPatchChanges};
 
 use super::__rust_begin_short_backtrace;
 
+const MAX_INLINE_SYSTEMS: usize = 16;
+
 /// Borrowed data used by the [`MultiThreadedExecutor`].
 struct Environment<'env, 'sys> {
     executor: &'env MultiThreadedExecutor,
@@ -95,6 +97,9 @@ pub struct MultiThreadedExecutor {
     apply_final_deferred: bool,
     /// Allow the scope caller to execute a Send system when starting an idle frontier.
     scope_thread_execution: bool,
+    inline_system_continuations: bool,
+    #[cfg(test)]
+    task_spawns: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
     starting_systems: FixedBitSet,
@@ -290,7 +295,7 @@ impl SystemExecutor for MultiThreadedExecutor {
 
                 // The first tick won't need to process finished systems, but we still need to run the loop in
                 // tick_executor() in case a system completes while the first tick still holds the mutex.
-                context.tick_executor();
+                let _ = context.tick_executor(false);
             },
         );
 
@@ -328,7 +333,12 @@ impl SystemExecutor for MultiThreadedExecutor {
 }
 
 impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
-    fn system_completed(&self, system_index: usize, res: Result<(), Box<dyn Any + Send>>) {
+    fn system_completed(
+        &self,
+        system_index: usize,
+        res: Result<(), Box<dyn Any + Send>>,
+        allow_inline: bool,
+    ) -> Option<usize> {
         // tell the executor that the system finished
         self.environment
             .executor
@@ -340,7 +350,7 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
             let mut panic_payload = self.environment.executor.panic_payload.lock().unwrap();
             *panic_payload = Some(payload);
         }
-        self.tick_executor();
+        self.tick_executor(allow_inline)
     }
 
     #[expect(
@@ -355,7 +365,8 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
         Some((conditions, guard))
     }
 
-    fn tick_executor(&self) {
+    fn tick_executor(&self, allow_inline: bool) -> Option<usize> {
+        let mut continuation = None;
         // Ensure that the executor handles any events pushed to the system_completion queue by this thread.
         // If this thread acquires the lock, the executor runs after the push() and they are processed.
         // If this thread does not acquire the lock, then the is_empty() check on the other thread runs
@@ -363,19 +374,30 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
         // on this thread, so the is_empty() check will see the new events and loop.
         loop {
             let Some((conditions, mut guard)) = self.try_lock() else {
-                return;
+                return continuation;
             };
-            guard.tick(self, conditions);
+            guard.tick(self, conditions, allow_inline, &mut continuation);
             // Make sure we drop the guard before checking system_completion.is_empty(), or we could lose events.
             drop(guard);
             if self.environment.executor.system_completion.is_empty() {
-                return;
+                return continuation;
             }
         }
     }
 }
 
 impl MultiThreadedExecutor {
+    /// Reuses a running `Send` task for a bounded chain of ready systems.
+    ///
+    /// Disabled by default. All access, condition and dependency checks still run.
+    /// Independent branches remain available to the pool. A task yields back to
+    /// normal dispatch after at most 16 systems; non-Send and exclusive systems
+    /// always use their existing thread-affine paths.
+    pub fn with_inline_system_continuations(mut self, enabled: bool) -> Self {
+        self.inline_system_continuations = enabled;
+        self
+    }
+
     /// Allows otherwise worker-bound systems to run on the schedule's calling thread.
     ///
     /// Disabled by default. When enabled, a `Send` system starting an idle execution
@@ -398,6 +420,9 @@ impl MultiThreadedExecutor {
             starting_systems: FixedBitSet::new(),
             apply_final_deferred: true,
             scope_thread_execution: false,
+            inline_system_continuations: false,
+            #[cfg(test)]
+            task_spawns: None,
             panic_payload: Mutex::new(None),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
@@ -424,7 +449,13 @@ impl ExecutorState {
         }
     }
 
-    fn tick(&mut self, context: &Context, conditions: &mut Conditions) {
+    fn tick(
+        &mut self,
+        context: &Context,
+        conditions: &mut Conditions,
+        allow_inline: bool,
+        continuation: &mut Option<usize>,
+    ) {
         #[cfg(feature = "trace")]
         let _span = context.environment.executor.executor_span.enter();
 
@@ -436,7 +467,7 @@ impl ExecutorState {
         // - `finish_system_and_handle_dependents` has updated the currently running systems.
         // - `rebuild_active_access` locks access for all currently running systems.
         unsafe {
-            self.spawn_system_tasks(context, conditions);
+            self.spawn_system_tasks(context, conditions, allow_inline, continuation);
         }
     }
 
@@ -445,7 +476,13 @@ impl ExecutorState {
     ///   have been mutably borrowed (such as the systems currently running).
     /// - `world_cell` must have permission to access all world data (not counting
     ///   any world data that is claimed by systems currently running on this executor).
-    unsafe fn spawn_system_tasks(&mut self, context: &Context, conditions: &mut Conditions) {
+    unsafe fn spawn_system_tasks(
+        &mut self,
+        context: &Context,
+        conditions: &mut Conditions,
+        allow_inline: bool,
+        continuation: &mut Option<usize>,
+    ) {
         if self.exclusive_running {
             return;
         }
@@ -531,6 +568,16 @@ impl ExecutorState {
                     }
                     check_for_new_ready_systems = false;
                     break;
+                }
+
+                if allow_inline
+                    && continuation.is_none()
+                    && self.system_task_metadata[system_index].is_send
+                {
+                    // Access is reserved in running_systems just as for a spawned
+                    // task. The caller executes it only after dropping the mutex.
+                    *continuation = Some(system_index);
+                    continue;
                 }
 
                 // SAFETY:
@@ -656,35 +703,47 @@ impl ExecutorState {
     /// - `world` must have permission to access the world data
     ///   used by the specified system.
     unsafe fn spawn_system_task(&mut self, context: &Context, system_index: usize) {
-        let system = &context.environment.systems[system_index];
+        #[cfg(test)]
+        if let Some(count) = &context.environment.executor.task_spawns {
+            count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         // Move the full context object into the new future.
         let context = *context;
 
-        let system_meta = &self.system_task_metadata[system_index];
-
-        let task = async move {
-            let res = handle_errors(
-                |system| {
-                    // SAFETY:
-                    // - The caller ensures that we have permission to
-                    // access the world data used by the system.
-                    // - `is_exclusive` returned false
-                    unsafe {
-                        __rust_begin_short_backtrace::run_unsafe(
-                            system,
-                            context.environment.world_cell,
-                        )
-                    }
-                },
-                // SAFETY: this system is not running, no other reference exists
-                unsafe { &mut (*system.get()).system },
-                context.error_handler,
-                "System panicked",
-            );
-            context.system_completed(system_index, res);
+        let is_send = self.system_task_metadata[system_index].is_send;
+        let budget = if is_send && context.environment.executor.inline_system_continuations {
+            MAX_INLINE_SYSTEMS
+        } else {
+            1
         };
 
-        if system_meta.is_send {
+        let task = async move {
+            let mut system_index = system_index;
+            for completed in 0..budget {
+                let system = &context.environment.systems[system_index];
+                let res = handle_errors(
+                    |system| {
+                        // SAFETY: the system was reserved by spawn_system_tasks
+                        // after access checks; exclusive systems are never claimed.
+                        unsafe {
+                            __rust_begin_short_backtrace::run_unsafe(
+                                system,
+                                context.environment.world_cell,
+                            )
+                        }
+                    },
+                    // SAFETY: only this task owns the reserved system.
+                    unsafe { &mut (*system.get()).system },
+                    context.error_handler,
+                    "System panicked",
+                );
+                let next = context.system_completed(system_index, res, completed + 1 < budget);
+                let Some(next) = next else { break };
+                system_index = next;
+            }
+        };
+
+        if is_send {
             if self.num_running_systems == 1
                 && context
                     .scope_thread
@@ -724,7 +783,7 @@ impl ExecutorState {
                     world,
                     context.error_handler,
                 );
-                context.system_completed(system_index, res);
+                let _ = context.system_completed(system_index, res, false);
             };
 
             context.scope.spawn_on_scope(task);
@@ -740,7 +799,7 @@ impl ExecutorState {
                     context.error_handler,
                     "Exclusive system panicked",
                 );
-                context.system_completed(system_index, res);
+                let _ = context.system_completed(system_index, res, false);
             };
 
             context.scope.spawn_on_scope(task);
@@ -949,107 +1008,263 @@ mod tests {
     #[derive(Resource)]
     struct R;
 
+    // T1: a real Schedule/World and the actual task-spawn boundary. No timing
+    // thresholds; independent expected order and the public 16-system budget.
+    #[test]
+    fn inline_continuations_reuse_tasks_and_yield_at_the_batch_budget() {
+        use crate::{prelude::ResMut, schedule::SystemSet};
+        use core::sync::atomic::AtomicUsize;
+        use std::{sync::Arc, vec::Vec};
+
+        #[derive(Resource, Default)]
+        struct Steps(Vec<usize>);
+        #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+        struct Step(usize);
+
+        for enabled in [false, true] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut executor =
+                MultiThreadedExecutor::new().with_inline_system_continuations(enabled);
+            executor.task_spawns = Some(count.clone());
+            let mut schedule = Schedule::default();
+            schedule.set_executor(executor);
+            for index in 0..40 {
+                let system = (move |mut steps: ResMut<Steps>| {
+                    assert_eq!(steps.0.len() % 40, index);
+                    steps.0.push(index);
+                })
+                .in_set(Step(index));
+                if index == 0 {
+                    schedule.add_systems(system);
+                } else {
+                    schedule.add_systems(system.after(Step(index - 1)));
+                }
+            }
+            let mut world = World::new();
+            world.init_resource::<Steps>();
+            for run in 1..=2 {
+                schedule.run(&mut world);
+                let expected: Vec<_> = (0..run).flat_map(|_| 0..40).collect();
+                assert_eq!(world.resource::<Steps>().0, expected);
+                assert_eq!(
+                    count.load(Relaxed),
+                    if enabled { 3 * run } else { 40 * run },
+                    "continuation must reduce real task spawns and release after 16 systems"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_continuations_preserve_deferred_exclusive_and_non_send_boundaries() {
+        use crate::prelude::{Res, ResMut};
+        use std::{thread, vec, vec::Vec};
+
+        #[derive(Resource, Default)]
+        struct Trace(Vec<&'static str>);
+        #[derive(Default)]
+        struct Affinity(Option<thread::ThreadId>);
+
+        for caller in [false, true] {
+            let mut world = World::new();
+            world.init_resource::<Trace>();
+            world.insert_non_send(Affinity::default());
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(caller)
+                    .with_inline_system_continuations(true),
+            );
+            schedule.add_systems(
+                (
+                    |mut commands: Commands, mut trace: ResMut<Trace>| {
+                        trace.0.push("produce");
+                        commands.insert_resource(R);
+                    },
+                    |_: Res<R>, mut trace: ResMut<Trace>| trace.0.push("read"),
+                    |world: &mut World| {
+                        assert!(world.contains_resource::<R>());
+                        world.resource_mut::<Trace>().0.push("exclusive");
+                    },
+                    |mut affinity: NonSendMut<Affinity>, mut trace: ResMut<Trace>| {
+                        affinity.0 = Some(thread::current().id());
+                        trace.0.push("non-send");
+                    },
+                    |mut trace: ResMut<Trace>| trace.0.push("send-after"),
+                )
+                    .chain(),
+            );
+            schedule.run(&mut world);
+            assert_eq!(
+                world.resource::<Trace>().0,
+                vec!["produce", "read", "exclusive", "non-send", "send-after"]
+            );
+            assert_eq!(world.non_send::<Affinity>().0, Some(thread::current().id()));
+        }
+    }
+
+    #[test]
+    fn inline_continuations_finish_dependents_before_propagating_handler_panic() {
+        use crate::prelude::ResMut;
+        use std::{vec, vec::Vec};
+
+        #[derive(Resource, Default)]
+        struct Trace(Vec<usize>);
+        fn handler(_: BevyError, _: ErrorContext) {
+            panic!("continuation handler panic");
+        }
+
+        let mut world = World::new();
+        world.init_resource::<Trace>();
+        world.insert_resource(FallbackErrorHandler(handler));
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new().with_inline_system_continuations(true));
+        schedule.add_systems(
+            (
+                |mut trace: ResMut<Trace>| trace.0.push(0),
+                |mut trace: ResMut<Trace>| {
+                    trace.0.push(1);
+                    Err(BevyError::ignore("handled error"))
+                },
+                |mut trace: ResMut<Trace>| trace.0.push(2),
+            )
+                .chain(),
+        );
+        let result = catch_unwind(AssertUnwindSafe(|| schedule.run(&mut world)));
+        let payload = result.unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"continuation handler panic")
+        );
+        assert_eq!(world.resource::<Trace>().0, vec![0, 1, 2]);
+    }
+
     #[test]
     fn scope_thread_execution_keeps_a_serial_chain_on_the_caller() {
-        use std::{
-            sync::{Arc, Mutex},
-            thread, vec,
-            vec::Vec,
-        };
+        for continuations in [false, true] {
+            use std::{
+                sync::{Arc, Mutex},
+                thread, vec,
+                vec::Vec,
+            };
 
-        let caller = thread::current().id();
-        let threads = Arc::new(Mutex::new(Vec::new()));
-        let record = || {
-            let threads = threads.clone();
-            move || threads.lock().unwrap().push(thread::current().id())
-        };
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
-        schedule.add_systems((record(), record(), record()).chain());
-        schedule.run(&mut World::new());
-        assert_eq!(*threads.lock().unwrap(), vec![caller; 3]);
+            let caller = thread::current().id();
+            let threads = Arc::new(Mutex::new(Vec::new()));
+            let record = || {
+                let threads = threads.clone();
+                move || threads.lock().unwrap().push(thread::current().id())
+            };
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(true)
+                    .with_inline_system_continuations(continuations),
+            );
+            schedule.add_systems((record(), record(), record()).chain());
+            schedule.run(&mut World::new());
+            assert_eq!(*threads.lock().unwrap(), vec![caller; 3]);
+        }
     }
 
     #[test]
     fn default_executor_keeps_send_systems_on_workers() {
-        use std::{
-            sync::{Arc, Mutex},
-            thread,
-        };
+        for continuations in [false, true] {
+            use std::{
+                sync::{Arc, Mutex},
+                thread,
+            };
 
-        let caller = thread::current().id();
-        let observed = Arc::new(Mutex::new(None));
-        let record = observed.clone();
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new());
-        schedule.add_systems(move || *record.lock().unwrap() = Some(thread::current().id()));
-        schedule.run(&mut World::new());
-        assert!(observed
-            .lock()
-            .unwrap()
-            .is_some_and(|thread| thread != caller));
+            let caller = thread::current().id();
+            let observed = Arc::new(Mutex::new(None));
+            let record = observed.clone();
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new().with_inline_system_continuations(continuations),
+            );
+            schedule.add_systems(move || *record.lock().unwrap() = Some(thread::current().id()));
+            schedule.run(&mut World::new());
+            assert!(observed
+                .lock()
+                .unwrap()
+                .is_some_and(|thread| thread != caller));
+        }
     }
 
     #[test]
     fn scope_thread_execution_preserves_parallel_work() {
-        use std::{
-            sync::{mpsc, Arc, Mutex},
-            thread,
-            time::Duration,
-            vec::Vec,
-        };
+        for continuations in [false, true] {
+            use std::{
+                sync::{mpsc, Arc, Mutex},
+                thread,
+                time::Duration,
+                vec::Vec,
+            };
 
-        let caller = thread::current().id();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let (a_tx, a_rx) = mpsc::channel();
-        let (b_tx, b_rx) = mpsc::channel();
-        let make_system = |send: mpsc::Sender<()>, receive: mpsc::Receiver<()>| {
-            let observed = observed.clone();
-            let receive = Mutex::new(receive);
-            move || {
-                observed.lock().unwrap().push(thread::current().id());
-                send.send(()).unwrap();
-                receive
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap();
-            }
-        };
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
-        schedule.add_systems((make_system(a_tx, b_rx), make_system(b_tx, a_rx)));
-        schedule.run(&mut World::new());
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 2);
-        assert!(observed.contains(&caller));
-        assert!(observed.iter().any(|thread| *thread != caller));
+            let caller = thread::current().id();
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let (a_tx, a_rx) = mpsc::channel();
+            let (b_tx, b_rx) = mpsc::channel();
+            let make_system = |send: mpsc::Sender<()>, receive: mpsc::Receiver<()>| {
+                let observed = observed.clone();
+                let receive = Mutex::new(receive);
+                move || {
+                    observed.lock().unwrap().push(thread::current().id());
+                    send.send(()).unwrap();
+                    receive
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap();
+                }
+            };
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(true)
+                    .with_inline_system_continuations(continuations),
+            );
+            // Exercise fan-out from completion, including claiming one inline
+            // successor while the other branch must remain available to a worker.
+            schedule
+                .add_systems((|| {}, (make_system(a_tx, b_rx), make_system(b_tx, a_rx))).chain());
+            schedule.run(&mut World::new());
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 2);
+            assert!(observed.contains(&caller));
+            assert!(observed.iter().any(|thread| *thread != caller));
+        }
     }
 
     #[test]
     fn scope_thread_execution_uses_the_current_run_thread() {
-        use std::{
-            sync::{Arc, Mutex},
-            thread, vec,
-            vec::Vec,
-        };
+        for continuations in [false, true] {
+            use std::{
+                sync::{Arc, Mutex},
+                thread, vec,
+                vec::Vec,
+            };
 
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let record = observed.clone();
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
-        schedule.add_systems(move || record.lock().unwrap().push(thread::current().id()));
-        let first_caller = thread::current().id();
-        let mut world = World::new();
-        schedule.run(&mut world);
-        let second_caller = thread::spawn(move || {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let record = observed.clone();
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(true)
+                    .with_inline_system_continuations(continuations),
+            );
+            schedule.add_systems(move || record.lock().unwrap().push(thread::current().id()));
+            let first_caller = thread::current().id();
+            let mut world = World::new();
             schedule.run(&mut world);
-            thread::current().id()
-        })
-        .join()
-        .unwrap();
-        assert_ne!(first_caller, second_caller);
-        assert_eq!(*observed.lock().unwrap(), vec![first_caller, second_caller]);
+            let second_caller = thread::spawn(move || {
+                schedule.run(&mut world);
+                thread::current().id()
+            })
+            .join()
+            .unwrap();
+            assert_ne!(first_caller, second_caller);
+            assert_eq!(*observed.lock().unwrap(), vec![first_caller, second_caller]);
+        }
     }
 
     struct ExclusiveMarker;
@@ -1082,11 +1297,15 @@ mod tests {
 
     #[test]
     fn skipped_systems_notify_dependents() {
-        for scope_thread_execution in [false, true] {
+        for (scope_thread_execution, continuations) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut world = World::new();
             let mut schedule = Schedule::default();
             schedule.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule.add_systems(
                 (
@@ -1107,7 +1326,9 @@ mod tests {
     /// cleared and prevented subsequent non-send system runs
     #[test]
     fn exclusive_system_reporting_send_releases_the_local_thread() {
-        for scope_thread_execution in [false, true] {
+        for (scope_thread_execution, continuations) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             #[derive(Default)]
             struct NonSendMarker(bool);
 
@@ -1116,7 +1337,9 @@ mod tests {
 
             let mut schedule = Schedule::default();
             schedule.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule.add_systems(
                 (
@@ -1138,11 +1361,15 @@ mod tests {
     /// inside an `async` block and somehow remaining alive even after its last use.
     #[test]
     fn check_spawn_exclusive_system_task_miri() {
-        for scope_thread_execution in [false, true] {
+        for (scope_thread_execution, continuations) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut world = World::new();
             let mut schedule = Schedule::default();
             schedule.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule.add_systems(((|_: Commands| {}), |_: Commands| {}).chain());
             schedule.run(&mut world);
@@ -1151,18 +1378,24 @@ mod tests {
 
     #[test]
     fn panic_to_error() {
-        for scope_thread_execution in [false, true] {
+        for (scope_thread_execution, continuations) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut world = World::new();
 
             let mut schedule_error = Schedule::default();
             schedule_error.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule_error.add_systems(|| Err(BevyError::ignore("")));
 
             let mut schedule_panic = Schedule::default();
             schedule_panic.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule_panic.add_systems(|| {
                 panic!("System's panic payload");
@@ -1222,13 +1455,17 @@ mod tests {
             };
             let mut schedule_condition_error = Schedule::default();
             schedule_condition_error.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule_condition_error.add_systems(system.run_if(|| Err(BevyError::ignore(""))));
 
             let mut schedule_condition_panic = Schedule::default();
             schedule_condition_panic.set_executor(
-                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+                MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(scope_thread_execution)
+                    .with_inline_system_continuations(continuations),
             );
             schedule_condition_panic.add_systems(system.run_if(|| {
                 panic!("Condition's panic payload");
