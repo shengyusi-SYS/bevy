@@ -5,7 +5,10 @@ use bevy_tasks::{ComputeTaskPool, Scope, TaskPool, ThreadExecutor};
 use concurrent_queue::ConcurrentQueue;
 use core::{any::Any, panic::AssertUnwindSafe};
 use fixedbitset::FixedBitSet;
-use std::sync::{Mutex, MutexGuard};
+use std::{
+    sync::{Mutex, MutexGuard},
+    thread::{self, ThreadId},
+};
 
 #[cfg(feature = "trace")]
 use tracing::{info_span, Span};
@@ -90,6 +93,8 @@ pub struct MultiThreadedExecutor {
     system_completion: ConcurrentQueue<SystemResult>,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
+    /// Allow the scope caller to execute a Send system when starting an idle frontier.
+    scope_thread_execution: bool,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
     starting_systems: FixedBitSet,
@@ -138,6 +143,7 @@ struct Context<'scope, 'env, 'sys> {
     environment: &'env Environment<'env, 'sys>,
     scope: &'scope Scope<'scope, 'env, ()>,
     error_handler: ErrorHandler,
+    scope_thread: Option<ThreadId>,
 }
 
 impl Default for MultiThreadedExecutor {
@@ -279,6 +285,7 @@ impl SystemExecutor for MultiThreadedExecutor {
                     environment,
                     scope,
                     error_handler,
+                    scope_thread: self.scope_thread_execution.then(|| thread::current().id()),
                 };
 
                 // The first tick won't need to process finished systems, but we still need to run the loop in
@@ -369,6 +376,18 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
 }
 
 impl MultiThreadedExecutor {
+    /// Allows otherwise worker-bound systems to run on the schedule's calling thread.
+    ///
+    /// Disabled by default. When enabled, a `Send` system starting an idle execution
+    /// frontier on that thread may use the scope executor. Other systems remain
+    /// available to workers, so non-conflicting systems can still run in parallel.
+    /// This may reduce handoffs for schedules with short, serialized systems, but
+    /// can delay other work serviced by the calling thread when systems run for longer.
+    pub fn with_scope_thread_execution(mut self, enabled: bool) -> Self {
+        self.scope_thread_execution = enabled;
+        self
+    }
+
     /// Creates a new `multi_threaded` executor for use with a [`Schedule`].
     ///
     /// [`Schedule`]: crate::schedule::Schedule
@@ -378,6 +397,7 @@ impl MultiThreadedExecutor {
             system_completion: ConcurrentQueue::unbounded(),
             starting_systems: FixedBitSet::new(),
             apply_final_deferred: true,
+            scope_thread_execution: false,
             panic_payload: Mutex::new(None),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
@@ -665,7 +685,17 @@ impl ExecutorState {
         };
 
         if system_meta.is_send {
-            context.scope.spawn(task);
+            if self.num_running_systems == 1
+                && context
+                    .scope_thread
+                    .is_some_and(|caller| caller == thread::current().id())
+            {
+                // Only enqueue while holding the scheduling mutex. The existing
+                // scope executor polls the task after the mutex has been released.
+                context.scope.spawn_on_scope(task);
+            } else {
+                context.scope.spawn(task);
+            }
         } else {
             self.local_thread_running = true;
             context.scope.spawn_on_external(task);
@@ -919,6 +949,109 @@ mod tests {
     #[derive(Resource)]
     struct R;
 
+    #[test]
+    fn scope_thread_execution_keeps_a_serial_chain_on_the_caller() {
+        use std::{
+            sync::{Arc, Mutex},
+            thread, vec,
+            vec::Vec,
+        };
+
+        let caller = thread::current().id();
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let record = || {
+            let threads = threads.clone();
+            move || threads.lock().unwrap().push(thread::current().id())
+        };
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
+        schedule.add_systems((record(), record(), record()).chain());
+        schedule.run(&mut World::new());
+        assert_eq!(*threads.lock().unwrap(), vec![caller; 3]);
+    }
+
+    #[test]
+    fn default_executor_keeps_send_systems_on_workers() {
+        use std::{
+            sync::{Arc, Mutex},
+            thread,
+        };
+
+        let caller = thread::current().id();
+        let observed = Arc::new(Mutex::new(None));
+        let record = observed.clone();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        schedule.add_systems(move || *record.lock().unwrap() = Some(thread::current().id()));
+        schedule.run(&mut World::new());
+        assert!(observed
+            .lock()
+            .unwrap()
+            .is_some_and(|thread| thread != caller));
+    }
+
+    #[test]
+    fn scope_thread_execution_preserves_parallel_work() {
+        use std::{
+            sync::{mpsc, Arc, Mutex},
+            thread,
+            time::Duration,
+            vec::Vec,
+        };
+
+        let caller = thread::current().id();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let (a_tx, a_rx) = mpsc::channel();
+        let (b_tx, b_rx) = mpsc::channel();
+        let make_system = |send: mpsc::Sender<()>, receive: mpsc::Receiver<()>| {
+            let observed = observed.clone();
+            let receive = Mutex::new(receive);
+            move || {
+                observed.lock().unwrap().push(thread::current().id());
+                send.send(()).unwrap();
+                receive
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap();
+            }
+        };
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
+        schedule.add_systems((make_system(a_tx, b_rx), make_system(b_tx, a_rx)));
+        schedule.run(&mut World::new());
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed.contains(&caller));
+        assert!(observed.iter().any(|thread| *thread != caller));
+    }
+
+    #[test]
+    fn scope_thread_execution_uses_the_current_run_thread() {
+        use std::{
+            sync::{Arc, Mutex},
+            thread, vec,
+            vec::Vec,
+        };
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let record = observed.clone();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new().with_scope_thread_execution(true));
+        schedule.add_systems(move || record.lock().unwrap().push(thread::current().id()));
+        let first_caller = thread::current().id();
+        let mut world = World::new();
+        schedule.run(&mut world);
+        let second_caller = thread::spawn(move || {
+            schedule.run(&mut world);
+            thread::current().id()
+        })
+        .join()
+        .unwrap();
+        assert_ne!(first_caller, second_caller);
+        assert_eq!(*observed.lock().unwrap(), vec![first_caller, second_caller]);
+    }
+
     struct ExclusiveMarker;
 
     // SAFETY: No world data is accessed.
@@ -949,47 +1082,55 @@ mod tests {
 
     #[test]
     fn skipped_systems_notify_dependents() {
-        let mut world = World::new();
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new());
-        schedule.add_systems(
-            (
-                (|| {}).run_if(|| false),
-                // This system depends on a system that is always skipped.
-                |mut commands: Commands| {
-                    commands.insert_resource(R);
-                },
-            )
-                .chain(),
-        );
-        schedule.run(&mut world);
-        assert!(world.get_resource::<R>().is_some());
+        for scope_thread_execution in [false, true] {
+            let mut world = World::new();
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule.add_systems(
+                (
+                    (|| {}).run_if(|| false),
+                    // This system depends on a system that is always skipped.
+                    |mut commands: Commands| {
+                        commands.insert_resource(R);
+                    },
+                )
+                    .chain(),
+            );
+            schedule.run(&mut world);
+            assert!(world.get_resource::<R>().is_some());
+        }
     }
 
     /// Regression test for case where exclusive system left local thread state as not
     /// cleared and prevented subsequent non-send system runs
     #[test]
     fn exclusive_system_reporting_send_releases_the_local_thread() {
-        #[derive(Default)]
-        struct NonSendMarker(bool);
+        for scope_thread_execution in [false, true] {
+            #[derive(Default)]
+            struct NonSendMarker(bool);
 
-        let mut world = World::new();
-        world.insert_non_send(NonSendMarker::default());
+            let mut world = World::new();
+            world.insert_non_send(NonSendMarker::default());
 
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new());
-        schedule.add_systems(
-            (
-                |_: ExclusiveMarker| {},
-                |mut marker: NonSendMut<NonSendMarker>| {
-                    marker.0 = true;
-                },
-            )
-                .chain(),
-        );
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule.add_systems(
+                (
+                    |_: ExclusiveMarker| {},
+                    |mut marker: NonSendMut<NonSendMarker>| {
+                        marker.0 = true;
+                    },
+                )
+                    .chain(),
+            );
 
-        schedule.run(&mut world);
-        assert!(world.non_send::<NonSendMarker>().0);
+            schedule.run(&mut world);
+            assert!(world.non_send::<NonSendMarker>().0);
+        }
     }
 
     /// Regression test for a weird bug flagged by MIRI in
@@ -997,123 +1138,162 @@ mod tests {
     /// inside an `async` block and somehow remaining alive even after its last use.
     #[test]
     fn check_spawn_exclusive_system_task_miri() {
-        let mut world = World::new();
-        let mut schedule = Schedule::default();
-        schedule.set_executor(MultiThreadedExecutor::new());
-        schedule.add_systems(((|_: Commands| {}), |_: Commands| {}).chain());
-        schedule.run(&mut world);
+        for scope_thread_execution in [false, true] {
+            let mut world = World::new();
+            let mut schedule = Schedule::default();
+            schedule.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule.add_systems(((|_: Commands| {}), |_: Commands| {}).chain());
+            schedule.run(&mut world);
+        }
     }
 
     #[test]
     fn panic_to_error() {
-        let mut world = World::new();
+        for scope_thread_execution in [false, true] {
+            let mut world = World::new();
 
-        let mut schedule_error = Schedule::default();
-        schedule_error.set_executor(MultiThreadedExecutor::new());
-        schedule_error.add_systems(|| Err(BevyError::ignore("")));
+            let mut schedule_error = Schedule::default();
+            schedule_error.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule_error.add_systems(|| Err(BevyError::ignore("")));
 
-        let mut schedule_panic = Schedule::default();
-        schedule_panic.set_executor(MultiThreadedExecutor::new());
-        schedule_panic.add_systems(|| {
-            panic!("System's panic payload");
-        });
+            let mut schedule_panic = Schedule::default();
+            schedule_panic.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule_panic.add_systems(|| {
+                panic!("System's panic payload");
+            });
 
-        static HANDLER_CALLED: AtomicBool = AtomicBool::new(false);
-        fn handle(_: BevyError, ctx: ErrorContext) {
-            assert!(matches!(ctx, ErrorContext::System { .. }));
-            HANDLER_CALLED.store(true, Relaxed);
+            static HANDLER_CALLED: AtomicBool = AtomicBool::new(false);
+            fn handle(_: BevyError, ctx: ErrorContext) {
+                assert!(matches!(ctx, ErrorContext::System { .. }));
+                HANDLER_CALLED.store(true, Relaxed);
+            }
+            world.insert_resource(FallbackErrorHandler(handle));
+
+            HANDLER_CALLED.store(false, Relaxed);
+            SYSTEM_RAN.store(false, Relaxed);
+
+            // System error
+            schedule_error.run(&mut world);
+            assert!(HANDLER_CALLED.load(Relaxed));
+
+            // System panic
+            HANDLER_CALLED.store(false, Relaxed);
+            schedule_panic.run(&mut world);
+            assert!(HANDLER_CALLED.load(Relaxed));
+
+            const PANIC_PAYLOAD: &str = "UwU";
+            fn panic(_: BevyError, ctx: ErrorContext) {
+                assert!(matches!(ctx, ErrorContext::System { .. }));
+                panic!("{}", PANIC_PAYLOAD);
+            }
+            world.insert_resource(FallbackErrorHandler(panic));
+
+            // System error, handler panic
+            let result = catch_unwind(AssertUnwindSafe(|| schedule_error.run(&mut world)));
+            let payload = result.unwrap_err();
+            assert_eq!(
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
+                PANIC_PAYLOAD
+            );
+
+            // System panic, handler panic
+            let result = catch_unwind(AssertUnwindSafe(|| schedule_panic.run(&mut world)));
+            let payload = result.unwrap_err();
+            assert_eq!(
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
+                PANIC_PAYLOAD
+            );
+
+            static SYSTEM_RAN: AtomicBool = AtomicBool::new(false);
+            let system = || {
+                SYSTEM_RAN.store(true, Relaxed);
+            };
+            let mut schedule_condition_error = Schedule::default();
+            schedule_condition_error.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule_condition_error.add_systems(system.run_if(|| Err(BevyError::ignore(""))));
+
+            let mut schedule_condition_panic = Schedule::default();
+            schedule_condition_panic.set_executor(
+                MultiThreadedExecutor::new().with_scope_thread_execution(scope_thread_execution),
+            );
+            schedule_condition_panic.add_systems(system.run_if(|| {
+                panic!("Condition's panic payload");
+            }));
+
+            fn handle_condition(_: BevyError, ctx: ErrorContext) {
+                assert!(matches!(ctx, ErrorContext::RunCondition { .. }));
+                HANDLER_CALLED.store(true, Relaxed);
+            }
+            fn panic_condition(_: BevyError, ctx: ErrorContext) {
+                assert!(matches!(ctx, ErrorContext::RunCondition { .. }));
+                HANDLER_CALLED.store(true, Relaxed);
+                panic!("{}", PANIC_PAYLOAD);
+            }
+            world.insert_resource(FallbackErrorHandler(handle_condition));
+
+            // Condition error
+            HANDLER_CALLED.store(false, Relaxed);
+            SYSTEM_RAN.store(false, Relaxed);
+            schedule_condition_error.run(&mut world);
+            assert!(HANDLER_CALLED.load(Relaxed));
+            assert!(!SYSTEM_RAN.load(Relaxed));
+
+            // Condition panic
+            HANDLER_CALLED.store(false, Relaxed);
+            SYSTEM_RAN.store(false, Relaxed);
+            schedule_condition_panic.run(&mut world);
+            assert!(HANDLER_CALLED.load(Relaxed));
+            assert!(!SYSTEM_RAN.load(Relaxed));
+
+            world.insert_resource(FallbackErrorHandler(panic_condition));
+
+            // Condition error, handler panic
+            HANDLER_CALLED.store(false, Relaxed);
+            SYSTEM_RAN.store(false, Relaxed);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                schedule_condition_error.run(&mut world)
+            }));
+            let payload = result.unwrap_err();
+            assert_eq!(
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
+                PANIC_PAYLOAD
+            );
+            assert!(HANDLER_CALLED.load(Relaxed));
+            assert!(!SYSTEM_RAN.load(Relaxed));
+
+            // Condition panic, handler panic
+            HANDLER_CALLED.store(false, Relaxed);
+            SYSTEM_RAN.store(false, Relaxed);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                schedule_condition_panic.run(&mut world)
+            }));
+            let payload = result.unwrap_err();
+            assert_eq!(
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
+                PANIC_PAYLOAD
+            );
+            assert!(HANDLER_CALLED.load(Relaxed));
+            assert!(!SYSTEM_RAN.load(Relaxed));
         }
-        world.insert_resource(FallbackErrorHandler(handle));
-
-        // System error
-        schedule_error.run(&mut world);
-        assert!(HANDLER_CALLED.load(Relaxed));
-
-        // System panic
-        HANDLER_CALLED.store(false, Relaxed);
-        schedule_panic.run(&mut world);
-        assert!(HANDLER_CALLED.load(Relaxed));
-
-        const PANIC_PAYLOAD: &str = "UwU";
-        fn panic(_: BevyError, ctx: ErrorContext) {
-            assert!(matches!(ctx, ErrorContext::System { .. }));
-            panic!("{}", PANIC_PAYLOAD);
-        }
-        world.insert_resource(FallbackErrorHandler(panic));
-
-        // System error, handler panic
-        let result = catch_unwind(AssertUnwindSafe(|| schedule_error.run(&mut world)));
-        let payload = result.unwrap_err();
-        assert_eq!(
-            payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
-            PANIC_PAYLOAD
-        );
-
-        // System panic, handler panic
-        let result = catch_unwind(AssertUnwindSafe(|| schedule_panic.run(&mut world)));
-        let payload = result.unwrap_err();
-        assert_eq!(
-            payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
-            PANIC_PAYLOAD
-        );
-
-        static SYSTEM_RAN: AtomicBool = AtomicBool::new(false);
-        let system = || {
-            SYSTEM_RAN.store(true, Relaxed);
-        };
-        let mut schedule_condition_error = Schedule::default();
-        schedule_condition_error.set_executor(MultiThreadedExecutor::new());
-        schedule_condition_error.add_systems(system.run_if(|| Err(BevyError::ignore(""))));
-
-        let mut schedule_condition_panic = Schedule::default();
-        schedule_condition_panic.set_executor(MultiThreadedExecutor::new());
-        schedule_condition_panic.add_systems(system.run_if(|| {
-            panic!("Condition's panic payload");
-        }));
-
-        world.insert_resource(FallbackErrorHandler(handle));
-
-        // Condition error
-        schedule_error.run(&mut world);
-        assert!(HANDLER_CALLED.load(Relaxed));
-        assert!(!SYSTEM_RAN.load(Relaxed));
-
-        // Condition panic
-        HANDLER_CALLED.store(false, Relaxed);
-        schedule_panic.run(&mut world);
-        assert!(HANDLER_CALLED.load(Relaxed));
-        assert!(!SYSTEM_RAN.load(Relaxed));
-
-        world.insert_resource(FallbackErrorHandler(panic));
-
-        // Condition error, handler panic
-        let result = catch_unwind(AssertUnwindSafe(|| schedule_error.run(&mut world)));
-        let payload = result.unwrap_err();
-        assert_eq!(
-            payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
-            PANIC_PAYLOAD
-        );
-        assert!(!SYSTEM_RAN.load(Relaxed));
-
-        // Condition panic, handler panic
-        let result = catch_unwind(AssertUnwindSafe(|| schedule_panic.run(&mut world)));
-        let payload = result.unwrap_err();
-        assert_eq!(
-            payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or_else(|| payload.downcast_ref::<&str>().unwrap()),
-            PANIC_PAYLOAD
-        );
-        assert!(!SYSTEM_RAN.load(Relaxed));
     }
 }
