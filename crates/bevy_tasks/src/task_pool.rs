@@ -946,6 +946,52 @@ mod tests {
     }
 
     #[test]
+    fn scope_global_tick_controls_unrelated_work_on_the_caller() {
+        use std::{sync::mpsc, time::Duration};
+
+        let (resume_workers, wait_for_resume) = async_channel::unbounded::<()>();
+        let pool = TaskPoolBuilder::new()
+            .num_threads(2)
+            .on_thread_spawn(move || {
+                let _ = wait_for_resume.recv_blocking();
+            })
+            .build();
+        // This guard drops before the pool, including on assertion failure.
+        let _resume_workers = CallOnDrop(Some(Arc::new(move || {
+            resume_workers.close();
+        })));
+        assert!(!pool.threads.is_empty());
+        let caller = thread::current().id();
+
+        for tick_global in [false, true] {
+            let (observed, observation) = mpsc::channel();
+            let global_task = pool.spawn(async move {
+                let _ = observed.send(thread::current().id());
+            });
+            let (finish_scope, scope_can_finish) = async_channel::bounded(1);
+            let coordinator = thread::spawn(move || {
+                // The deadline bounds the expected absence of global progress
+                // in the disabled case and releases the scope on either result.
+                let observed = observation.recv_timeout(Duration::from_secs(1));
+                let _ = finish_scope.send_blocking(());
+                observed
+            });
+            pool.scope_with_executor(tick_global, None, |scope| {
+                scope.spawn_on_scope(async {
+                    scope_can_finish.recv().await.unwrap();
+                });
+            });
+            let observed = coordinator.join().unwrap();
+            if tick_global {
+                assert_eq!(observed.unwrap(), caller);
+            } else {
+                assert!(matches!(observed, Err(mpsc::RecvTimeoutError::Timeout)));
+            }
+            drop(global_task);
+        }
+    }
+
+    #[test]
     fn test_spawn() {
         let pool = TaskPool::new();
 
