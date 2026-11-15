@@ -10,8 +10,9 @@ use core::ops::Range;
 /// reader will chunk up the remaining events.
 ///
 /// By default, this batch size is automatically determined by dividing
-/// the size of the largest matched archetype by the number
-/// of threads (rounded up). This attempts to minimize the overhead of scheduling
+/// the operation's candidate item count by the number of threads (rounded up).
+/// Queries count rows across all matched tables or archetypes; dynamic filters
+/// may reduce the number of entities actually visited. This attempts to minimize the overhead of scheduling
 /// tasks onto multiple threads, but assumes each entity has roughly the
 /// same amount of work to be done, which may not hold true in every
 /// workload.

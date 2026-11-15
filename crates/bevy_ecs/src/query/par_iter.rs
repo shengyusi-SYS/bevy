@@ -35,6 +35,59 @@ pub struct QueryParIter<'w, 's, D: IterQueryData, F: QueryFilter> {
     pub(crate) batching_strategy: BatchingStrategy,
 }
 
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "multi_threaded"))]
+mod batching_tests {
+    use crate::batching::BatchingStrategy;
+    use crate::prelude::*;
+
+    // A query's work spans all matched storages. Fragmentation must not
+    // multiply its intended batches-per-thread budget.
+    #[test]
+    fn default_batch_size_accounts_for_all_matched_storages() {
+        #[derive(Component)]
+        struct Value;
+        #[derive(Component)]
+        struct A;
+        #[derive(Component)]
+        struct B;
+        #[derive(Component)]
+        struct C;
+        #[derive(Component)]
+        #[component(storage = "SparseSet")]
+        struct Sparse;
+
+        let mut world = World::new();
+        for mask in 0..8 {
+            for row in 0..16 {
+                let mut entity = world.spawn(Value);
+                if mask & 1 != 0 {
+                    entity.insert(A);
+                }
+                if mask & 2 != 0 {
+                    entity.insert(B);
+                }
+                if mask & 4 != 0 {
+                    entity.insert(C);
+                }
+                if row % 2 == 0 {
+                    entity.insert(Sparse);
+                }
+            }
+        }
+        let mut dense = world.query::<&Value>();
+        assert_eq!(dense.par_iter(&world).get_batch_size(4), 32);
+        let mut sparse = world.query_filtered::<&Value, With<Sparse>>();
+        assert_eq!(sparse.par_iter(&world).get_batch_size(4), 16);
+        assert_eq!(
+            dense
+                .par_iter(&world)
+                .batching_strategy(BatchingStrategy::fixed(7))
+                .get_batch_size(4),
+            7
+        );
+    }
+}
+
 impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
     /// Changes the batching strategy used when iterating.
     ///
@@ -173,27 +226,27 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
     fn get_batch_size(&self, thread_count: usize) -> u32 {
-        let max_items = || {
+        // Budget tasks for the whole query, not separately for every small
+        // storage. Dynamic filters may reduce the rows actually visited.
+        let total_items = || {
             let id_iter = self.state.matched_storage_ids.iter();
             if self.state.is_dense {
                 // SAFETY: We only access table metadata.
                 let tables = unsafe { &self.world.world_metadata().storages().tables };
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores TableIds
-                    .map(|id| unsafe { tables[id.table_id].entity_count() })
-                    .max()
+                    .map(|id| unsafe { tables[id.table_id].entity_count() } as usize)
+                    .sum()
             } else {
                 let archetypes = &self.world.archetypes();
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores ArchetypeIds
-                    .map(|id| unsafe { archetypes[id.archetype_id].len() })
-                    .max()
+                    .map(|id| unsafe { archetypes[id.archetype_id].len() } as usize)
+                    .sum()
             }
-            .map(|v| v as usize)
-            .unwrap_or(0)
         };
         self.batching_strategy
-            .calc_batch_size(max_items, thread_count) as u32
+            .calc_batch_size(total_items, thread_count) as u32
     }
 }
 
@@ -360,7 +413,7 @@ where
     /// current batching strategy.
     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
     fn get_batch_size(&self, thread_count: usize) -> u32 {
-        let max_items = || {
+        let total_items = || {
             let id_iter = self.state.matched_storage_ids.iter();
             // SAFETY: We only access table metadata.
             let tables = unsafe { &self.world.storages().tables };
@@ -369,14 +422,12 @@ where
                     // SAFETY: Contiguous iteration can only process tables, so
                     // we must have a table here.
                     let table_id = unsafe { id.table_id };
-                    tables[table_id].entity_count()
+                    tables[table_id].entity_count() as usize
                 })
-                .max()
-                .map(|v| v as usize)
-                .unwrap_or(0)
+                .sum()
         };
         self.batching_strategy
-            .calc_batch_size(max_items, thread_count) as u32
+            .calc_batch_size(total_items, thread_count) as u32
     }
 }
 
