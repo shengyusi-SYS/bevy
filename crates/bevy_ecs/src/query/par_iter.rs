@@ -10,6 +10,19 @@ use super::{IterQueryData, QueryFilter, QueryItem, QueryState, ReadOnlyQueryData
 
 use alloc::vec::Vec;
 
+// Temporary opt-in experiment: isolate small-query dispatch from outer ECS
+// parallelism before selecting a public/per-world policy. No default changes.
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+fn diagnostic_query_min_rows() -> u32 {
+    static MINIMUM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MINIMUM.get_or_init(|| {
+        std::env::var("BEVY_DIAGNOSTIC_QUERY_MIN_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// A parallel iterator over query results of a [`Query`](crate::system::Query).
 ///
 /// This struct is created by the [`Query::par_iter`](crate::system::Query::par_iter) and
@@ -103,7 +116,7 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
         #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
         {
             let thread_count = bevy_tasks::ComputeTaskPool::get().thread_num();
-            if thread_count <= 1 {
+            if thread_count <= 1 || self.has_fewer_matched_rows(diagnostic_query_min_rows()) {
                 let init = init();
                 // SAFETY: See the safety comment above.
                 unsafe {
@@ -128,6 +141,34 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
                 }
             }
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+    fn has_fewer_matched_rows(&self, mut remaining: u32) -> bool {
+        if remaining == 0 {
+            return false;
+        }
+        // Count candidate rows only, without accessing component values or
+        // evaluating dynamic filters. Stop as soon as parallel work is large.
+        // SAFETY: only shared table metadata is inspected, as in get_batch_size;
+        // component values and ticks are not accessed through this reference.
+        let tables = unsafe { &self.world.world_metadata().storages().tables };
+        let archetypes = self.world.archetypes();
+        for id in &self.state.matched_storage_ids {
+            let count = if self.state.is_dense {
+                // SAFETY: dense matched_storage_ids contain valid TableIds;
+                // only immutable metadata is read, as in get_batch_size.
+                tables[unsafe { id.table_id }].entity_count()
+            } else {
+                // SAFETY: sparse matched_storage_ids contain ArchetypeIds.
+                archetypes[unsafe { id.archetype_id }].len()
+            };
+            if count >= remaining {
+                return false;
+            }
+            remaining -= count;
+        }
+        true
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
