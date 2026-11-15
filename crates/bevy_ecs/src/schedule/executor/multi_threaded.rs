@@ -92,7 +92,7 @@ pub struct MultiThreadedExecutor {
     system_completion: ConcurrentQueue<SystemResult>,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
-    /// Allow the scope caller to execute a Send system when starting an idle frontier.
+    /// Allow the scope caller to participate in Send system execution.
     scope_thread_execution: bool,
     inline_system_continuations: bool,
     #[cfg(test)]
@@ -123,6 +123,8 @@ pub struct ExecutorState {
     num_running_send_systems: usize,
     /// Keep ready roots available for continuation rather than queueing all of them.
     max_running_send_systems: usize,
+    /// The Send reservation owned by the scope caller in cooperative inline mode.
+    scope_thread_system: Option<usize>,
     /// The number of dependencies each system has that have not been satisfied. A dependency
     /// is satisfied when the predecessor completes.
     num_dependencies_remaining: Vec<usize>,
@@ -151,6 +153,8 @@ struct Context<'scope, 'env, 'sys> {
     environment: &'env Environment<'env, 'sys>,
     scope: &'scope Scope<'scope, 'env, ()>,
     error_handler: ErrorHandler,
+    /// A continuation of this task must retain the caller's Send reservation.
+    inline_on_scope: bool,
 }
 
 impl Default for MultiThreadedExecutor {
@@ -258,6 +262,7 @@ impl SystemExecutor for MultiThreadedExecutor {
         let task_pool = ComputeTaskPool::get_or_init(TaskPool::default);
         state.num_running_systems = 0;
         state.num_running_send_systems = 0;
+        state.scope_thread_system = None;
         state.max_running_send_systems = if self.inline_system_continuations {
             task_pool
                 .thread_num()
@@ -299,6 +304,7 @@ impl SystemExecutor for MultiThreadedExecutor {
                 environment,
                 scope,
                 error_handler,
+                inline_on_scope: false,
             };
 
             // The first tick won't need to process finished systems, but we still need to run the loop in
@@ -401,6 +407,8 @@ impl MultiThreadedExecutor {
     /// normal dispatch after at most 16 systems; non-Send and exclusive systems
     /// always use their existing thread-affine paths. Ready Send work beyond
     /// the pool/caller capacity remains available for these continuations.
+    /// When caller cooperation is also enabled, one Send reservation remains
+    /// available to that caller across task-budget boundaries.
     pub fn with_inline_system_continuations(mut self, enabled: bool) -> Self {
         self.inline_system_continuations = enabled;
         self
@@ -412,6 +420,8 @@ impl MultiThreadedExecutor {
     /// frontier may use the scope executor, including when a worker completes
     /// the last running system. Other systems remain
     /// available to workers, so non-conflicting systems can still run in parallel.
+    /// With inline continuations enabled, one caller reservation is maintained
+    /// while workers execute other branches, including across task-budget yields.
     /// This may reduce handoffs for schedules with short, serialized systems, but
     /// can delay other work serviced by the calling thread when systems run for longer.
     pub fn with_scope_thread_execution(mut self, enabled: bool) -> Self {
@@ -449,6 +459,7 @@ impl ExecutorState {
             num_running_systems: 0,
             num_running_send_systems: 0,
             max_running_send_systems: usize::MAX,
+            scope_thread_system: None,
             num_dependencies_remaining: Vec::new(),
             local_thread_running: false,
             exclusive_running: false,
@@ -590,9 +601,13 @@ impl ExecutorState {
                 if allow_inline
                     && continuation.is_none()
                     && self.system_task_metadata[system_index].is_send
+                    && (!context.inline_on_scope || self.scope_thread_system.is_none())
                 {
                     // Access is reserved in running_systems just as for a spawned
                     // task. The caller executes it only after dropping the mutex.
+                    if context.inline_on_scope {
+                        self.scope_thread_system = Some(system_index);
+                    }
                     *continuation = Some(system_index);
                     continue;
                 }
@@ -743,11 +758,23 @@ impl ExecutorState {
                 .count();
             peak.fetch_max(pending, core::sync::atomic::Ordering::Relaxed);
         }
-        // Move the full context object into the new future.
-        let context = *context;
-
         let is_send = self.system_task_metadata[system_index].is_send;
-        let budget = if is_send && context.environment.executor.inline_system_continuations {
+        let inline = context.environment.executor.inline_system_continuations;
+        let on_scope = is_send
+            && context.environment.executor.scope_thread_execution
+            && if inline {
+                self.scope_thread_system.is_none()
+            } else {
+                self.num_running_systems == 1
+            };
+        if on_scope && inline {
+            self.scope_thread_system = Some(system_index);
+        }
+        // Each future carries its actual destination, not the destination of
+        // the completing task that happened to advance this scheduling tick.
+        let mut context = *context;
+        context.inline_on_scope = on_scope && inline;
+        let budget = if is_send && inline {
             MAX_INLINE_SYSTEMS
         } else {
             1
@@ -780,8 +807,7 @@ impl ExecutorState {
         };
 
         if is_send {
-            if self.num_running_systems == 1 && context.environment.executor.scope_thread_execution
-            {
+            if on_scope {
                 // Enqueueing does not poll this task inline. Completion is
                 // coordinated by the existing scheduling mutex and completion queue.
                 context.scope.spawn_on_scope(task);
@@ -799,7 +825,8 @@ impl ExecutorState {
     unsafe fn spawn_exclusive_system_task(&mut self, context: &Context, system_index: usize) {
         let system = &context.environment.systems[system_index];
         // Move the full context object into the new future.
-        let context = *context;
+        let mut context = *context;
+        context.inline_on_scope = false;
 
         // SAFETY: this system is not running, no other reference exists
         if is_apply_deferred(unsafe { &*(*system.get()).system }) {
@@ -861,6 +888,9 @@ impl ExecutorState {
         if metadata.is_send && !metadata.is_exclusive {
             debug_assert!(self.num_running_send_systems >= 1);
             self.num_running_send_systems -= 1;
+        }
+        if self.scope_thread_system == Some(system_index) {
+            self.scope_thread_system = None;
         }
         self.running_systems.remove(system_index);
         self.completed_systems.insert(system_index);
@@ -1045,6 +1075,77 @@ mod tests {
 
     #[derive(Resource)]
     struct R;
+
+    // T1: actual Send systems on a saturated pool. The caller must remain a
+    // participant after the documented 16-system inline budget. The timeout
+    // releases blocked workers on regression; it is not a performance target.
+    #[test]
+    fn scope_caller_continues_after_inline_budget_with_workers_busy() {
+        use bevy_tasks::{ComputeTaskPool, TaskPool};
+        use core::sync::atomic::AtomicUsize;
+        use std::{
+            sync::{Arc, Condvar, Mutex},
+            thread,
+            time::Duration,
+        };
+
+        let workers = ComputeTaskPool::get_or_init(TaskPool::default).thread_num();
+        let roots = (workers + 1) * 2 + 64;
+        let caller = thread::current().id();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let caller_runs = Arc::new(AtomicUsize::new(0));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut schedule = Schedule::default();
+        schedule.set_executor(
+            MultiThreadedExecutor::new()
+                .with_scope_thread_execution(true)
+                .with_inline_system_continuations(true),
+        );
+        for _ in 0..roots {
+            let (runs, caller_runs, timed_out, gate) = (
+                runs.clone(),
+                caller_runs.clone(),
+                timed_out.clone(),
+                gate.clone(),
+            );
+            schedule.add_systems(move || {
+                if thread::current().id() == caller {
+                    if caller_runs.fetch_add(1, Relaxed) + 1 >= 32 {
+                        *gate.0.lock().unwrap() = true;
+                        gate.1.notify_all();
+                    }
+                } else {
+                    let (mut released, timeout) = gate
+                        .1
+                        .wait_timeout_while(
+                            gate.0.lock().unwrap(),
+                            Duration::from_secs(2),
+                            |released| !*released,
+                        )
+                        .unwrap();
+                    if timeout.timed_out() && !*released {
+                        timed_out.store(true, Relaxed);
+                        *released = true;
+                        gate.1.notify_all();
+                    }
+                }
+                runs.fetch_add(1, Relaxed);
+            });
+        }
+        let mut world = World::new();
+        for run in 1..=2 {
+            *gate.0.lock().unwrap() = false;
+            caller_runs.store(0, Relaxed);
+            schedule.run(&mut world);
+            assert_eq!(runs.load(Relaxed), roots * run);
+            assert!(
+                !timed_out.load(Relaxed),
+                "caller lost runnable work after the inline budget"
+            );
+            assert!(caller_runs.load(Relaxed) >= 32);
+        }
+    }
 
     // T1: observe reserved Send work at the real task-spawn boundary. This
     // bound does not depend on whether a worker or the caller wins the mutex.
