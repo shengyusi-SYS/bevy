@@ -9,9 +9,10 @@ use core::ops::Range;
 /// chunks of at most a certain batch size. Similarly, a parallel event
 /// reader will chunk up the remaining events.
 ///
-/// By default, this batch size is automatically determined by dividing
-/// the size of the largest matched archetype by the number
-/// of threads (rounded up). This attempts to minimize the overhead of scheduling
+/// By default, element-wise queries divide all matched storage rows by the
+/// number of threads (rounded up), packing small storages into shared tasks.
+/// Contiguous queries use the largest matched storage, while entity-list and
+/// message iterators use their list length. This attempts to minimize the overhead of scheduling
 /// tasks onto multiple threads, but assumes each entity has roughly the
 /// same amount of work to be done, which may not hold true in every
 /// workload.

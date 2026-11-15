@@ -132,27 +132,89 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
     fn get_batch_size(&self, thread_count: usize) -> u32 {
-        let max_items = || {
+        // Small storages are packed into shared tasks below. Size those tasks
+        // from the whole query, not only its largest individual storage.
+        let total_items = || {
             let id_iter = self.state.matched_storage_ids.iter();
             if self.state.is_dense {
                 // SAFETY: We only access table metadata.
                 let tables = unsafe { &self.world.world_metadata().storages().tables };
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores TableIds
-                    .map(|id| unsafe { tables[id.table_id].entity_count() })
-                    .max()
+                    .map(|id| unsafe { tables[id.table_id].entity_count() as usize })
+                    .sum()
             } else {
                 let archetypes = &self.world.archetypes();
                 id_iter
                     // SAFETY: The if check ensures that matched_storage_ids stores ArchetypeIds
-                    .map(|id| unsafe { archetypes[id.archetype_id].len() })
-                    .max()
+                    .map(|id| unsafe { archetypes[id.archetype_id].len() as usize })
+                    .sum()
             }
-            .map(|v| v as usize)
-            .unwrap_or(0)
         };
         self.batching_strategy
-            .calc_batch_size(max_items, thread_count) as u32
+            .calc_batch_size(total_items, thread_count) as u32
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "multi_threaded"))]
+mod batching_tests {
+    use super::*;
+    use crate::prelude::{Component, With, World};
+
+    #[derive(Component)]
+    struct Value;
+    #[derive(Component)]
+    struct Tag<const N: u8>;
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct Sparse;
+
+    // T1: actual QueryParIter planning over fragmented table and sparse storage.
+    // No threads or timing are needed to observe the chosen dispatch granularity.
+    #[test]
+    fn element_batches_account_for_all_matched_storage_rows() {
+        let mut world = World::new();
+        for tags in 0..64 {
+            for row in 0..8 {
+                let mut entity = world.spawn(Value);
+                if tags & 1 != 0 {
+                    entity.insert(Tag::<0>);
+                }
+                if tags & 2 != 0 {
+                    entity.insert(Tag::<1>);
+                }
+                if tags & 4 != 0 {
+                    entity.insert(Tag::<2>);
+                }
+                if tags & 8 != 0 {
+                    entity.insert(Tag::<3>);
+                }
+                if tags & 16 != 0 {
+                    entity.insert(Tag::<4>);
+                }
+                if tags & 32 != 0 {
+                    entity.insert(Tag::<5>);
+                }
+                if row % 2 == 0 {
+                    entity.insert(Sparse);
+                }
+            }
+        }
+
+        let mut dense = world.query::<&Value>();
+        assert!(dense.is_dense);
+        assert_eq!(dense.par_iter(&world).get_batch_size(4), 128);
+        assert_eq!(
+            dense
+                .par_iter(&world)
+                .batching_strategy(BatchingStrategy::fixed(7))
+                .get_batch_size(4),
+            7
+        );
+
+        let mut sparse = world.query_filtered::<&Value, With<Sparse>>();
+        assert!(!sparse.is_dense);
+        assert_eq!(sparse.par_iter(&world).get_batch_size(4), 64);
     }
 }
 
