@@ -94,16 +94,29 @@ pub fn render_system(
     world.run_schedule(RenderGraph);
 
     {
-        let render_device = world.resource::<RenderDevice>();
         let render_queue = world.resource::<RenderQueue>();
 
-        let mut encoder =
-            render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        if crate::view::screenshot::has_screenshot_commands(world)
+            || crate::gpu_readback::has_readback_commands(world)
+        {
+            let render_device = world.resource::<RenderDevice>();
+            let mut encoder =
+                render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        crate::view::screenshot::submit_screenshot_commands(world, screenshot_state, &mut encoder);
-        crate::gpu_readback::submit_readback_commands(world, &mut encoder);
+            crate::view::screenshot::submit_screenshot_commands(
+                world,
+                screenshot_state,
+                &mut encoder,
+            );
+            crate::gpu_readback::submit_readback_commands(world, &mut encoder);
 
-        render_queue.submit([encoder.finish()]);
+            render_queue.submit([encoder.finish()]);
+        } else {
+            // Preserve the submission boundary: late queue writes, callbacks
+            // and frame finalization must still be flushed before presenting.
+            // No transfer work requires an otherwise empty command buffer.
+            render_queue.submit([]);
+        }
     }
 
     {
