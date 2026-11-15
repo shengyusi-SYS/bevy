@@ -102,6 +102,8 @@ pub struct MultiThreadedExecutor {
     peak_pending_send_tasks: Option<Arc<core::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     ready_candidates_scanned: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    task_chunks: Option<Arc<Mutex<Vec<usize>>>>,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
     starting_systems: FixedBitSet,
@@ -472,6 +474,8 @@ impl MultiThreadedExecutor {
             peak_pending_send_tasks: None,
             #[cfg(test)]
             ready_candidates_scanned: None,
+            #[cfg(test)]
+            task_chunks: None,
             panic_payload: Mutex::new(None),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
@@ -835,7 +839,13 @@ impl ExecutorState {
 
         let task = async move {
             let mut system_index = system_index;
+            #[cfg(test)]
+            let mut chunk = 0;
             for completed in 0..budget {
+                #[cfg(test)]
+                {
+                    chunk += 1;
+                }
                 let system = &context.environment.systems[system_index];
                 let res = handle_errors(
                     |system| {
@@ -856,6 +866,10 @@ impl ExecutorState {
                 let next = context.system_completed(system_index, res, completed + 1 < budget);
                 let Some(next) = next else { break };
                 system_index = next;
+            }
+            #[cfg(test)]
+            if let Some(chunks) = &context.environment.executor.task_chunks {
+                chunks.lock().unwrap().push(chunk);
             }
         };
 
@@ -1326,7 +1340,10 @@ mod tests {
     fn inline_continuations_reuse_tasks_and_yield_at_the_batch_budget() {
         use crate::{prelude::ResMut, schedule::SystemSet};
         use core::sync::atomic::AtomicUsize;
-        use std::{sync::Arc, vec::Vec};
+        use std::{
+            sync::{Arc, Mutex},
+            vec::Vec,
+        };
 
         #[derive(Resource, Default)]
         struct Steps(Vec<usize>);
@@ -1334,35 +1351,50 @@ mod tests {
         struct Step(usize);
 
         for enabled in [false, true] {
-            let count = Arc::new(AtomicUsize::new(0));
-            let mut executor =
-                MultiThreadedExecutor::new().with_inline_system_continuations(enabled);
-            executor.task_spawns = Some(count.clone());
-            let mut schedule = Schedule::default();
-            schedule.set_executor(executor);
-            for index in 0..40 {
-                let system = (move |mut steps: ResMut<Steps>| {
-                    assert_eq!(steps.0.len() % 40, index);
-                    steps.0.push(index);
-                })
-                .in_set(Step(index));
-                if index == 0 {
-                    schedule.add_systems(system);
-                } else {
-                    schedule.add_systems(system.after(Step(index - 1)));
+            for caller in [false, true] {
+                let count = Arc::new(AtomicUsize::new(0));
+                let chunks = Arc::new(Mutex::new(Vec::new()));
+                let mut executor = MultiThreadedExecutor::new()
+                    .with_scope_thread_execution(caller)
+                    .with_inline_system_continuations(enabled);
+                executor.task_spawns = Some(count.clone());
+                executor.task_chunks = Some(chunks.clone());
+                let mut schedule = Schedule::default();
+                schedule.set_executor(executor);
+                for index in 0..40 {
+                    let system = (move |mut steps: ResMut<Steps>| {
+                        assert_eq!(steps.0.len() % 40, index);
+                        steps.0.push(index);
+                    })
+                    .in_set(Step(index));
+                    if index == 0 {
+                        schedule.add_systems(system);
+                    } else {
+                        schedule.add_systems(system.after(Step(index - 1)));
+                    }
                 }
-            }
-            let mut world = World::new();
-            world.init_resource::<Steps>();
-            for run in 1..=2 {
-                schedule.run(&mut world);
-                let expected: Vec<_> = (0..run).flat_map(|_| 0..40).collect();
-                assert_eq!(world.resource::<Steps>().0, expected);
-                assert_eq!(
-                    count.load(Relaxed),
-                    if enabled { 3 * run } else { 40 * run },
-                    "continuation must reduce real task spawns and release after 16 systems"
-                );
+                let mut world = World::new();
+                world.init_resource::<Steps>();
+                for run in 1..=2 {
+                    schedule.run(&mut world);
+                    let expected: Vec<_> = (0..run).flat_map(|_| 0..40).collect();
+                    assert_eq!(world.resource::<Steps>().0, expected);
+                    let chunks = chunks.lock().unwrap();
+                    assert_eq!(chunks.iter().sum::<usize>(), 40 * run);
+                    assert_eq!(chunks.len(), count.load(Relaxed));
+                    assert!(chunks
+                        .iter()
+                        .all(|&size| (1..=if enabled { 16 } else { 1 }).contains(&size)));
+                    // A worker may lose the coordinator mutex and end a task early.
+                    // The caller-only chain cannot race another carrier, so it also
+                    // proves that ready work is reused to the full public budget.
+                    if !enabled || caller {
+                        assert_eq!(
+                            count.load(Relaxed),
+                            if enabled { 3 * run } else { 40 * run }
+                        );
+                    }
+                }
             }
         }
     }
