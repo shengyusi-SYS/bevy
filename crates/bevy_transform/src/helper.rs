@@ -116,6 +116,7 @@ mod tests {
     }
 
     fn match_transform_propagation_systems_inner(transforms: Vec<Transform>) {
+        bevy_tasks::ComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
         let mut app = App::new();
         app.add_plugins(TransformPlugin);
 

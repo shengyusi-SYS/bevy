@@ -890,6 +890,9 @@ pub fn check_visibility_gpu_culling(
         ),
     >,
 ) {
+    if query.is_empty() {
+        return;
+    }
     query
         .par_iter_mut()
         .for_each(|(mut view_visibility, inherited_visibility)| {

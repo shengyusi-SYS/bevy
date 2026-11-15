@@ -131,6 +131,11 @@ pub fn mark_dirty_trees(
     if !static_optimizations.is_enabled() {
         return;
     }
+    // No producer input means the traversal/consumer pipeline has no work.
+    // In particular, ordinary UI motion need not wake transform workers.
+    if changed.is_empty() && orphaned.is_empty() {
+        return;
+    }
 
     // Simple serial implementation that iterates changed entities and traverses the tree.
     #[cfg(not(feature = "multi_threaded"))]
@@ -925,6 +930,7 @@ mod test {
 
     #[test]
     fn did_propagate_command_buffer() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let mut world = World::default();
 
         let mut schedule = Schedule::default();
@@ -1164,6 +1170,7 @@ mod test {
 
     #[test]
     fn global_transform_should_not_be_overwritten_after_reparenting() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
         let translation = Vec3::ONE;
         let mut world = World::new();
 

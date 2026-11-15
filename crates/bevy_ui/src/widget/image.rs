@@ -368,6 +368,88 @@ impl Measure for ImageMeasure {
 
 type UpdateImageFilter = (With<Node>, Without<crate::prelude::Text>);
 
+#[cfg(test)]
+mod content_size_tests {
+    use super::*;
+    use bevy_ecs::prelude::*;
+
+    #[test]
+    fn fixed_images_do_not_dirty_layout_on_texture_or_color_change() {
+        let mut world = World::new();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TextureAtlasLayout>>();
+        let texture = world.resource_mut::<Assets<Image>>().add(Image::default());
+        let entity = world
+            .spawn(ImageNode {
+                image_mode: NodeImageMode::Stretch,
+                ..ImageNode::new(texture)
+            })
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_image_content_size_system);
+        schedule.run(&mut world);
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().color = Color::BLACK;
+        schedule.run(&mut world);
+        assert!(!world
+            .entity(entity)
+            .get_ref::<ContentSize>()
+            .unwrap()
+            .is_changed());
+    }
+
+    #[test]
+    fn auto_image_measure_tracks_geometry_instead_of_texture_identity() {
+        let mut world = World::new();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TextureAtlasLayout>>();
+        let first = world.resource_mut::<Assets<Image>>().add(Image::default());
+        let second = world.resource_mut::<Assets<Image>>().add(Image::default());
+        let entity = world.spawn(ImageNode::new(first)).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_image_content_size_system);
+        schedule.run(&mut world);
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().image = second;
+        schedule.run(&mut world);
+        assert!(!world
+            .entity(entity)
+            .get_ref::<ContentSize>()
+            .unwrap()
+            .is_changed());
+
+        // A mode switch must restore measurement even when size is unchanged.
+        world.get_mut::<ImageNode>(entity).unwrap().image_mode = NodeImageMode::Stretch;
+        schedule.run(&mut world);
+        world.get_mut::<ImageNode>(entity).unwrap().image_mode = NodeImageMode::Auto;
+        world.clear_trackers();
+        schedule.run(&mut world);
+        assert!(matches!(
+            world.get::<ContentSize>(entity).unwrap().measure,
+            Some(NodeMeasure::Image(_))
+        ));
+
+        let mut resized = Image::default();
+        let mut size = resized.texture_descriptor.size;
+        size.width = 2;
+        size.height = 3;
+        resized.resize(size);
+        let resized = world.resource_mut::<Assets<Image>>().add(resized);
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().image = resized;
+        schedule.run(&mut world);
+        assert!(world
+            .entity(entity)
+            .get_ref::<ContentSize>()
+            .unwrap()
+            .is_changed());
+        assert!(
+            matches!(world.get::<ContentSize>(entity).unwrap().measure.as_ref(),
+            Some(NodeMeasure::Image(measure)) if measure.size == Vec2::new(2., 3.))
+        );
+    }
+}
+
 /// Updates content size of the node based on the image provided
 pub fn update_image_content_size_system(
     textures: Res<Assets<Image>>,
@@ -386,7 +468,7 @@ pub fn update_image_content_size_system(
         if !matches!(image.image_mode, NodeImageMode::Auto)
             || image.image.id() == TRANSPARENT_IMAGE_HANDLE.id()
         {
-            if image.is_changed() {
+            if image.is_changed() && content_size.measure.is_some() {
                 // Remove any existing measure.
                 content_size.clear();
             }
@@ -408,12 +490,19 @@ pub fn update_image_content_size_system(
                 || content_size.is_added()
                 || image.is_changed()
             {
-                image_size.size = size;
-                content_size.set(NodeMeasure::Image(ImageMeasure {
+                if image_size.size != size {
+                    image_size.size = size;
+                }
+                let measure = ImageMeasure {
                     // multiply the image size by the scale factor to get the physical size
                     size: size.as_vec2() * computed_target.scale_factor(),
                     visual_box: image.visual_box,
-                }));
+                };
+                let unchanged = matches!(content_size.measure.as_ref(), Some(NodeMeasure::Image(previous))
+                    if previous.size == measure.size && previous.visual_box == measure.visual_box);
+                if !unchanged {
+                    content_size.set(NodeMeasure::Image(measure));
+                }
             }
         }
     }
