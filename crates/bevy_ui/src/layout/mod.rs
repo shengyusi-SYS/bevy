@@ -5,6 +5,7 @@ use crate::{
     IgnoreScroll, LayoutConfig, Node, Outline, OverflowAxis, OverrideClip, ScrollPosition,
 };
 use bevy_ecs::{
+    batching::BatchingStrategy,
     change_detection::{DetectChanges, DetectChangesMut, Mut},
     component::Component,
     entity::{Entity, EntityHashSet},
@@ -274,7 +275,10 @@ pub fn sync_taffy_styles_with_nodes(
     };
     if rem_size.is_changed() {
         // A global unit change still requires all matching styles.
-        update_query.par_iter_mut().for_each(update);
+        update_query
+            .par_iter_mut()
+            .batching_strategy(BatchingStrategy::fixed(1024))
+            .for_each(update);
     } else {
         // Usually no input changed. Visit output components only for the
         // changed candidates, without dispatching a full parallel traversal.
@@ -492,27 +496,31 @@ pub fn ui_layout_system(
     }
 
     // Clear any UI node entities that became unreachable due to hierarchy changes.
-    node_queries.p1().par_iter_mut().for_each(
-        |(mut node, mut global_transform, mut computed_layout, is_ghost)| {
-            let reached = computed_layout.reached();
-            if !reached {
-                computed_layout.clear();
-            }
-            computed_layout.set_reached(false);
+    node_queries
+        .p1()
+        .par_iter_mut()
+        .batching_strategy(BatchingStrategy::fixed(1024))
+        .for_each(
+            |(mut node, mut global_transform, mut computed_layout, is_ghost)| {
+                let reached = computed_layout.reached();
+                if !reached {
+                    computed_layout.clear();
+                }
+                computed_layout.set_reached(false);
 
-            if (is_ghost && reached) || computed_layout.has_layout() {
-                return;
-            }
+                if (is_ghost && reached) || computed_layout.has_layout() {
+                    return;
+                }
 
-            if *node != ComputedNode::DEFAULT {
-                *node = ComputedNode::DEFAULT;
-            }
+                if *node != ComputedNode::DEFAULT {
+                    *node = ComputedNode::DEFAULT;
+                }
 
-            if *global_transform != UiGlobalTransform::default() {
-                *global_transform = UiGlobalTransform::default();
-            }
-        },
-    );
+                if *global_transform != UiGlobalTransform::default() {
+                    *global_transform = UiGlobalTransform::default();
+                }
+            },
+        );
 }
 
 /// Updates the [`ComputedNode`] and [`UiGlobalTransform`] components for each UI node entity.
@@ -869,6 +877,7 @@ pub fn update_border_radius(
 ) {
     node_update_query
         .par_iter_mut()
+        .batching_strategy(BatchingStrategy::fixed(1024))
         .for_each(|(mut node, style, target)| {
             // We don't trigger change detection for changes to border radius
             // unless the border radius actually changed

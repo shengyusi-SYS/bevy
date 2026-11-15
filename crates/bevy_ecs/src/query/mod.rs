@@ -819,6 +819,51 @@ mod tests {
     }
 
     #[test]
+    fn par_iter_fixed_batch_preserves_dense_and_sparse_results() {
+        use crate::batching::BatchingStrategy;
+
+        bevy_tasks::ComputeTaskPool::get_or_init(|| {
+            bevy_tasks::TaskPoolBuilder::new().num_threads(2).build()
+        });
+
+        // Exercise empty, single-batch, boundary and multi-batch queries with
+        // several tables/archetypes. Each selected component must change once.
+        for count in [0, 1, 31, 32, 33, 129] {
+            let mut world = World::new();
+            let entities: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut entity = world.spawn((A(i), B(0)));
+                    if i % 2 == 0 {
+                        entity.insert(Sparse(i));
+                    }
+                    if i % 3 == 0 {
+                        entity.insert(C(i));
+                    }
+                    entity.id()
+                })
+                .collect();
+
+            world
+                .query_filtered::<&mut B, With<A>>()
+                .par_iter_mut(&mut world)
+                .batching_strategy(BatchingStrategy::fixed(32))
+                .for_each(|mut b| b.0 += 1);
+            world
+                .query::<(&Sparse, &mut B)>()
+                .par_iter_mut(&mut world)
+                .batching_strategy(BatchingStrategy::fixed(32))
+                .for_each(|(_, mut b)| b.0 += 1);
+
+            for (i, entity) in entities.into_iter().enumerate() {
+                assert_eq!(
+                    world.get::<B>(entity).unwrap().0,
+                    if i % 2 == 0 { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn par_iter_many_unique_visits_each_listed_entity_once() {
         use crate::entity::UniqueEntityVec;
         use core::sync::atomic::{AtomicUsize, Ordering};

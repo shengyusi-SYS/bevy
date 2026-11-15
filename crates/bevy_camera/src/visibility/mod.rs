@@ -32,6 +32,7 @@ mod render_layers;
 
 use core::any::TypeId;
 
+use bevy_ecs::batching::BatchingStrategy;
 use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::lifecycle::HookContext;
 use bevy_ecs::world::DeferredWorld;
@@ -731,9 +732,12 @@ fn propagate_recursive(
 /// Track entities that were visible last frame, used to granularly update
 /// [`ViewVisibility`] this frame without spurious `Change` detecation.
 fn reset_view_visibility(mut reset_query: Query<&mut ViewVisibility, Without<NoCpuCulling>>) {
-    reset_query.par_iter_mut().for_each(|mut view_visibility| {
-        view_visibility.bypass_change_detection().update();
-    });
+    reset_query
+        .par_iter_mut()
+        .batching_strategy(BatchingStrategy::fixed(4096))
+        .for_each(|mut view_visibility| {
+            view_visibility.bypass_change_detection().update();
+        });
 }
 
 /// System updating the visibility of entities, other than those that have opted
@@ -910,6 +914,7 @@ fn mark_newly_hidden_entities_invisible(
 ) {
     view_visibilities
         .par_iter_mut()
+        .batching_strategy(BatchingStrategy::fixed(4096))
         .for_each(|mut view_visibility| {
             if view_visibility.as_ref().was_visible_now_hidden() {
                 *view_visibility = ViewVisibility::HIDDEN;

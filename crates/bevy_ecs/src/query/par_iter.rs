@@ -116,7 +116,17 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
         #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
         {
             let thread_count = bevy_tasks::ComputeTaskPool::get().thread_num();
-            if thread_count <= 1 || self.has_fewer_matched_rows(diagnostic_query_min_rows()) {
+            let batch_size = if thread_count > 1 {
+                self.get_batch_size(thread_count).max(1)
+            } else {
+                1
+            };
+            // A single batch has no parallel work to distribute. Respect the
+            // caller's existing batching strategy without creating a task scope.
+            if thread_count <= 1
+                || self.has_fewer_matched_rows(batch_size.saturating_add(1))
+                || self.has_fewer_matched_rows(diagnostic_query_min_rows())
+            {
                 let init = init();
                 // SAFETY: See the safety comment above.
                 unsafe {
@@ -126,8 +136,6 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
                         .fold(init, func);
                 }
             } else {
-                // Need a batch size of at least 1.
-                let batch_size = self.get_batch_size(thread_count).max(1);
                 // SAFETY: See the safety comment above.
                 unsafe {
                     self.state.par_fold_init_unchecked_manual(
