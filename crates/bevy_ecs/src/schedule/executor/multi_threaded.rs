@@ -3,7 +3,7 @@ use bevy_platform::cell::SyncUnsafeCell;
 use bevy_platform::sync::Arc;
 use bevy_tasks::{ComputeTaskPool, Scope, TaskPool, ThreadExecutor};
 use concurrent_queue::ConcurrentQueue;
-use core::{any::Any, panic::AssertUnwindSafe};
+use core::{any::Any, num::NonZeroUsize, panic::AssertUnwindSafe};
 use fixedbitset::FixedBitSet;
 use std::sync::{Mutex, MutexGuard};
 
@@ -95,13 +95,18 @@ pub struct MultiThreadedExecutor {
     /// Allow the scope caller to execute a Send system when starting an idle frontier.
     scope_thread_execution: bool,
     inline_system_continuations: bool,
+    max_parallel_send_systems: Option<NonZeroUsize>,
     #[cfg(test)]
     task_spawns: Option<Arc<core::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     peak_pending_send_tasks: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    ready_candidates_scanned: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
     starting_systems: FixedBitSet,
+    /// Systems that still need consideration when ordinary Send slots are full.
+    thread_affine_systems: FixedBitSet,
     /// Cached tracing span
     #[cfg(feature = "trace")]
     executor_span: Span,
@@ -168,6 +173,7 @@ impl SystemExecutor for MultiThreadedExecutor {
 
         self.system_completion = ConcurrentQueue::bounded(sys_count.max(1));
         self.starting_systems = FixedBitSet::with_capacity(sys_count);
+        self.thread_affine_systems = FixedBitSet::with_capacity(sys_count);
         state.evaluated_sets = FixedBitSet::with_capacity(set_count);
         state.ready_systems = FixedBitSet::with_capacity(sys_count);
         state.ready_systems_copy = FixedBitSet::with_capacity(sys_count);
@@ -178,6 +184,11 @@ impl SystemExecutor for MultiThreadedExecutor {
 
         state.system_task_metadata = Vec::with_capacity(sys_count);
         for index in 0..sys_count {
+            if !schedule.systems[index].system.is_send()
+                || schedule.systems[index].access.is_exclusive()
+            {
+                self.thread_affine_systems.insert(index);
+            }
             state.system_task_metadata.push(SystemTaskMetadata {
                 conflicting_systems: FixedBitSet::with_capacity(sys_count),
                 condition_conflicting_systems: FixedBitSet::with_capacity(sys_count),
@@ -258,7 +269,9 @@ impl SystemExecutor for MultiThreadedExecutor {
         let task_pool = ComputeTaskPool::get_or_init(TaskPool::default);
         state.num_running_systems = 0;
         state.num_running_send_systems = 0;
-        state.max_running_send_systems = if self.inline_system_continuations {
+        state.max_running_send_systems = if let Some(limit) = self.max_parallel_send_systems {
+            limit.get()
+        } else if self.inline_system_continuations {
             task_pool
                 .thread_num()
                 .saturating_add(usize::from(self.scope_thread_execution))
@@ -394,6 +407,17 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
 }
 
 impl MultiThreadedExecutor {
+    /// Limits how many non-exclusive `Send` systems may be running at once.
+    ///
+    /// This does not change the task pool or the parallel queries inside systems.
+    /// It can reduce scheduling contention when short systems also dispatch work
+    /// to the same pool. The default leaves the existing dispatch policy intact.
+    /// Non-Send and exclusive systems retain their original scheduling rules.
+    pub fn with_max_parallel_send_systems(mut self, limit: NonZeroUsize) -> Self {
+        self.max_parallel_send_systems = Some(limit);
+        self
+    }
+
     /// Reuses a running `Send` task for a bounded chain of ready systems.
     ///
     /// Disabled by default. All access, condition and dependency checks still run.
@@ -427,13 +451,17 @@ impl MultiThreadedExecutor {
             state: Mutex::new(ExecutorState::new()),
             system_completion: ConcurrentQueue::unbounded(),
             starting_systems: FixedBitSet::new(),
+            thread_affine_systems: FixedBitSet::new(),
             apply_final_deferred: true,
             scope_thread_execution: false,
             inline_system_continuations: false,
+            max_parallel_send_systems: None,
             #[cfg(test)]
             task_spawns: None,
             #[cfg(test)]
             peak_pending_send_tasks: None,
+            #[cfg(test)]
+            ready_candidates_scanned: None,
             panic_payload: Mutex::new(None),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
@@ -528,7 +556,32 @@ impl ExecutorState {
 
             ready_systems.clone_from(&self.ready_systems);
 
-            for system_index in ready_systems.ones() {
+            let record_candidate = |_: &usize| {
+                #[cfg(test)]
+                if let Some(scanned) = &context.environment.executor.ready_candidates_scanned {
+                    scanned.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            let mut all_ready = ready_systems.ones().inspect(record_candidate);
+            let mut thread_affine_ready = context
+                .environment
+                .executor
+                .thread_affine_systems
+                .ones()
+                .inspect(record_candidate)
+                .filter(|&index| ready_systems.contains(index));
+            let mut last_index = None;
+            loop {
+                // Completions cannot release slots while this scheduling lock
+                // is held. Once full, only consider the remaining non-Send or
+                // exclusive candidates, in the same index order as before.
+                let next = if self.num_running_send_systems >= self.max_running_send_systems {
+                    thread_affine_ready.find(|&index| last_index.is_none_or(|last| index > last))
+                } else {
+                    all_ready.next()
+                };
+                let Some(system_index) = next else { break };
+                last_index = Some(system_index);
                 debug_assert!(!self.running_systems.contains(system_index));
                 // SAFETY: Caller assured that these systems are not running.
                 // Therefore, no other reference to this system exists and there is no aliasing.
@@ -1045,6 +1098,84 @@ mod tests {
 
     #[derive(Resource)]
     struct R;
+
+    // T1: count real ready-frontier visits, not elapsed time. Independent roots
+    // need one visit each; full Send slots cannot make later Send roots runnable.
+    #[test]
+    fn bounded_send_dispatch_does_not_rescan_a_full_frontier() {
+        use core::{num::NonZeroUsize, sync::atomic::AtomicUsize};
+        use std::sync::Arc;
+
+        let roots = 128;
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut executor = MultiThreadedExecutor::new()
+            .with_scope_thread_execution(true)
+            .with_inline_system_continuations(true)
+            .with_max_parallel_send_systems(NonZeroUsize::new(2).unwrap());
+        executor.ready_candidates_scanned = Some(scanned.clone());
+        let mut schedule = Schedule::default();
+        schedule.set_executor(executor);
+        for _ in 0..roots {
+            let runs = runs.clone();
+            schedule.add_systems(move || {
+                runs.fetch_add(1, Relaxed);
+            });
+        }
+        let mut world = World::new();
+        for run in 1..=2 {
+            scanned.store(0, Relaxed);
+            schedule.run(&mut world);
+            assert_eq!(runs.load(Relaxed), roots * run);
+            assert_eq!(
+                scanned.load(Relaxed),
+                roots,
+                "full capacity must skip the remaining ordinary Send frontier"
+            );
+        }
+    }
+
+    // T1: the actual task-spawn boundary observes running_systems, independently
+    // of the configured limit. Reusing the schedule checks per-run reset too.
+    #[test]
+    fn explicit_send_concurrency_limit_bounds_spawned_and_inline_work() {
+        use core::{num::NonZeroUsize, sync::atomic::AtomicUsize};
+        use std::sync::Arc;
+
+        let roots = 64;
+        for inline in [false, true] {
+            for caller in [false, true] {
+                for limit in [1, 2] {
+                    let peak = Arc::new(AtomicUsize::new(0));
+                    let runs = Arc::new(AtomicUsize::new(0));
+                    let mut executor = MultiThreadedExecutor::new()
+                        .with_scope_thread_execution(caller)
+                        .with_inline_system_continuations(inline)
+                        .with_max_parallel_send_systems(NonZeroUsize::new(limit).unwrap());
+                    executor.peak_pending_send_tasks = Some(peak.clone());
+                    let mut schedule = Schedule::default();
+                    schedule.set_executor(executor);
+                    for _ in 0..roots {
+                        let runs = runs.clone();
+                        schedule.add_systems(move || {
+                            runs.fetch_add(1, Relaxed);
+                        });
+                    }
+                    let mut world = World::new();
+                    for run in 1..=2 {
+                        peak.store(0, Relaxed);
+                        schedule.run(&mut world);
+                        assert_eq!(runs.load(Relaxed), roots * run);
+                        assert_eq!(
+                            peak.load(Relaxed),
+                            limit,
+                            "reserved Send work must respect the explicit limit"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // T1: observe reserved Send work at the real task-spawn boundary. This
     // bound does not depend on whether a worker or the caller wins the mutex.
