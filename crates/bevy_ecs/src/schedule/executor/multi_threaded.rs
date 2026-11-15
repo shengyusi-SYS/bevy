@@ -97,6 +97,8 @@ pub struct MultiThreadedExecutor {
     inline_system_continuations: bool,
     #[cfg(test)]
     task_spawns: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    peak_pending_send_tasks: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
     starting_systems: FixedBitSet,
@@ -117,6 +119,10 @@ pub struct ExecutorState {
     exclusive_running: bool,
     /// The number of systems that are running.
     num_running_systems: usize,
+    /// Running Send systems, excluding thread-affine/exclusive work.
+    num_running_send_systems: usize,
+    /// Keep ready roots available for continuation rather than queueing all of them.
+    max_running_send_systems: usize,
     /// The number of dependencies each system has that have not been satisfied. A dependency
     /// is satisfied when the predecessor completes.
     num_dependencies_remaining: Vec<usize>,
@@ -249,7 +255,17 @@ impl SystemExecutor for MultiThreadedExecutor {
         if schedule.systems.is_empty() {
             return;
         }
+        let task_pool = ComputeTaskPool::get_or_init(TaskPool::default);
         state.num_running_systems = 0;
+        state.num_running_send_systems = 0;
+        state.max_running_send_systems = if self.inline_system_continuations {
+            task_pool
+                .thread_num()
+                .saturating_add(usize::from(self.scope_thread_execution))
+                .max(1)
+        } else {
+            usize::MAX
+        };
         state
             .num_dependencies_remaining
             .clone_from(&schedule.system_dependencies);
@@ -278,21 +294,17 @@ impl SystemExecutor for MultiThreadedExecutor {
 
         let environment = &Environment::new(self, schedule, world);
 
-        ComputeTaskPool::get_or_init(TaskPool::default).scope_with_executor(
-            false,
-            thread_executor,
-            |scope| {
-                let context = Context {
-                    environment,
-                    scope,
-                    error_handler,
-                };
+        task_pool.scope_with_executor(false, thread_executor, |scope| {
+            let context = Context {
+                environment,
+                scope,
+                error_handler,
+            };
 
-                // The first tick won't need to process finished systems, but we still need to run the loop in
-                // tick_executor() in case a system completes while the first tick still holds the mutex.
-                let _ = context.tick_executor(false);
-            },
-        );
+            // The first tick won't need to process finished systems, but we still need to run the loop in
+            // tick_executor() in case a system completes while the first tick still holds the mutex.
+            let _ = context.tick_executor(false);
+        });
 
         // End the borrows of self and world in environment by copying out the reference to systems.
         let systems = environment.systems;
@@ -387,7 +399,8 @@ impl MultiThreadedExecutor {
     /// Disabled by default. All access, condition and dependency checks still run.
     /// Independent branches remain available to the pool. A task yields back to
     /// normal dispatch after at most 16 systems; non-Send and exclusive systems
-    /// always use their existing thread-affine paths.
+    /// always use their existing thread-affine paths. Ready Send work beyond
+    /// the pool/caller capacity remains available for these continuations.
     pub fn with_inline_system_continuations(mut self, enabled: bool) -> Self {
         self.inline_system_continuations = enabled;
         self
@@ -419,6 +432,8 @@ impl MultiThreadedExecutor {
             inline_system_continuations: false,
             #[cfg(test)]
             task_spawns: None,
+            #[cfg(test)]
+            peak_pending_send_tasks: None,
             panic_payload: Mutex::new(None),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
@@ -432,6 +447,8 @@ impl ExecutorState {
             system_task_metadata: Vec::new(),
             set_condition_conflicting_systems: Vec::new(),
             num_running_systems: 0,
+            num_running_send_systems: 0,
+            max_running_send_systems: usize::MAX,
             num_dependencies_remaining: Vec::new(),
             local_thread_running: false,
             exclusive_running: false,
@@ -555,6 +572,10 @@ impl ExecutorState {
 
                 self.running_systems.insert(system_index);
                 self.num_running_systems += 1;
+                let metadata = &self.system_task_metadata[system_index];
+                if metadata.is_send && !metadata.is_exclusive {
+                    self.num_running_send_systems += 1;
+                }
 
                 if self.system_task_metadata[system_index].is_exclusive {
                     // SAFETY: `can_run` returned true for this system,
@@ -594,6 +615,13 @@ impl ExecutorState {
     fn can_run(&mut self, system_index: usize, conditions: &mut Conditions) -> bool {
         let system_meta = &self.system_task_metadata[system_index];
         if system_meta.is_exclusive && self.num_running_systems > 0 {
+            return false;
+        }
+
+        if system_meta.is_send
+            && !system_meta.is_exclusive
+            && self.num_running_send_systems >= self.max_running_send_systems
+        {
             return false;
         }
 
@@ -702,6 +730,18 @@ impl ExecutorState {
         #[cfg(test)]
         if let Some(count) = &context.environment.executor.task_spawns {
             count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        if let Some(peak) = &context.environment.executor.peak_pending_send_tasks {
+            let pending = self
+                .running_systems
+                .ones()
+                .filter(|&index| {
+                    let metadata = &self.system_task_metadata[index];
+                    metadata.is_send && !metadata.is_exclusive
+                })
+                .count();
+            peak.fetch_max(pending, core::sync::atomic::Ordering::Relaxed);
         }
         // Move the full context object into the new future.
         let context = *context;
@@ -817,6 +857,11 @@ impl ExecutorState {
 
         debug_assert!(self.num_running_systems >= 1);
         self.num_running_systems -= 1;
+        let metadata = &self.system_task_metadata[system_index];
+        if metadata.is_send && !metadata.is_exclusive {
+            debug_assert!(self.num_running_send_systems >= 1);
+            self.num_running_send_systems -= 1;
+        }
         self.running_systems.remove(system_index);
         self.completed_systems.insert(system_index);
         self.unapplied_systems.insert(system_index);
@@ -1000,6 +1045,44 @@ mod tests {
 
     #[derive(Resource)]
     struct R;
+
+    // T1: observe reserved Send work at the real task-spawn boundary. This
+    // bound does not depend on whether a worker or the caller wins the mutex.
+    #[test]
+    fn inline_continuations_bound_pending_tasks_for_wide_ready_frontiers() {
+        use bevy_tasks::{ComputeTaskPool, TaskPool};
+        use core::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let workers = ComputeTaskPool::get_or_init(TaskPool::default).thread_num();
+        let roots = (workers + 1) * 2 + 16;
+        for caller in [false, true] {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut executor = MultiThreadedExecutor::new()
+                .with_scope_thread_execution(caller)
+                .with_inline_system_continuations(true);
+            executor.peak_pending_send_tasks = Some(peak.clone());
+            let mut schedule = Schedule::default();
+            schedule.set_executor(executor);
+            for _ in 0..roots {
+                let runs = runs.clone();
+                schedule.add_systems(move || {
+                    runs.fetch_add(1, Relaxed);
+                });
+            }
+            let mut world = World::new();
+            for run in 1..=2 {
+                peak.store(0, Relaxed);
+                schedule.run(&mut world);
+                assert_eq!(runs.load(Relaxed), roots * run);
+                assert!(
+                    peak.load(Relaxed) <= (workers + usize::from(caller)).max(1),
+                    "pending Send tasks should fit the available pool/caller capacity"
+                );
+            }
+        }
+    }
 
     // T1: a real Schedule/World and the actual task-spawn boundary. No timing
     // thresholds; independent expected order and the public 16-system budget.
