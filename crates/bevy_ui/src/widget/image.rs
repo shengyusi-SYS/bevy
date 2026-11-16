@@ -5,9 +5,9 @@ use crate::{
 use bevy_asset::{AsAssetId, AssetId, Assets, Handle};
 use bevy_color::Color;
 use bevy_ecs::prelude::*;
-use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
+use bevy_image::{TRANSPARENT_IMAGE_HANDLE, prelude::*};
 use bevy_math::{Rect, UVec2, Vec2};
-use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+use bevy_reflect::{Reflect, std_traits::ReflectDefault};
 use bevy_sprite::TextureSlicer;
 use taffy::{MaybeMath, ResolveOrZero};
 
@@ -386,7 +386,7 @@ pub fn update_image_content_size_system(
         if !matches!(image.image_mode, NodeImageMode::Auto)
             || image.image.id() == TRANSPARENT_IMAGE_HANDLE.id()
         {
-            if image.is_changed() {
+            if image.is_changed() && content_size.measure.is_some() {
                 // Remove any existing measure.
                 content_size.clear();
             }
@@ -408,13 +408,159 @@ pub fn update_image_content_size_system(
                 || content_size.is_added()
                 || image.is_changed()
             {
-                image_size.size = size;
-                content_size.set(NodeMeasure::Image(ImageMeasure {
+                if image_size.size != size {
+                    image_size.size = size;
+                }
+                let measure = ImageMeasure {
                     // multiply the image size by the scale factor to get the physical size
                     size: size.as_vec2() * computed_target.scale_factor(),
                     visual_box: image.visual_box,
-                }));
+                };
+                if !matches!(content_size.measure.as_ref(), Some(NodeMeasure::Image(current))
+                    if current.size == measure.size && current.visual_box == measure.visual_box)
+                {
+                    content_size.set(NodeMeasure::Image(measure));
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod image_measure_changes {
+    use super::*;
+
+    fn fixture(mode: NodeImageMode) -> (World, Entity) {
+        let mut world = World::new();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<TextureAtlasLayout>>();
+        let image = world.resource_mut::<Assets<Image>>().add(Image::default());
+        let entity = world
+            .spawn((
+                ImageNode {
+                    image,
+                    image_mode: mode,
+                    ..Default::default()
+                },
+                ComputedUiRenderTargetInfo::default(),
+            ))
+            .id();
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        world.clear_trackers();
+        (world, entity)
+    }
+
+    #[test]
+    fn repaint_preserves_measure_ticks_but_region_and_visual_box_changes_update() {
+        let (mut world, entity) = fixture(NodeImageMode::Auto);
+        world.get_mut::<ImageNode>(entity).unwrap().color = Color::BLACK;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            !world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(
+            !world
+                .entity(entity)
+                .get_ref::<ImageNodeSize>()
+                .unwrap()
+                .is_changed()
+        );
+
+        world.clear_trackers();
+        let next = world.resource_mut::<Assets<Image>>().add(Image::default());
+        world.get_mut::<ImageNode>(entity).unwrap().image = next;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            !world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
+
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().rect =
+            Some(Rect::from_corners(Vec2::ZERO, Vec2::new(2., 1.)));
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
+        assert!(
+            matches!(world.get::<ContentSize>(entity).unwrap().measure.as_ref(), Some(NodeMeasure::Image(measure)) if measure.size == Vec2::new(2., 1.))
+        );
+
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().visual_box = VisualBox::PaddingBox;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
+    }
+
+    #[test]
+    fn scale_changes_update_the_existing_measure() {
+        let (mut world, entity) = fixture(NodeImageMode::Auto);
+        world
+            .get_mut::<ComputedUiRenderTargetInfo>(entity)
+            .unwrap()
+            .scale_factor = 2.;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            matches!(world.get::<ContentSize>(entity).unwrap().measure.as_ref(), Some(NodeMeasure::Image(measure)) if measure.size == Vec2::splat(2.))
+        );
+    }
+
+    #[test]
+    fn stretch_clears_auto_measure_once_and_leaves_empty_measure_unchanged() {
+        let (mut world, entity) = fixture(NodeImageMode::Auto);
+        world.get_mut::<ImageNode>(entity).unwrap().image_mode = NodeImageMode::Stretch;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(world.get::<ContentSize>(entity).unwrap().measure.is_none());
+        assert!(
+            world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
+
+        world.clear_trackers();
+        world.get_mut::<ImageNode>(entity).unwrap().color = Color::BLACK;
+        world
+            .run_system_cached(update_image_content_size_system)
+            .unwrap();
+        assert!(
+            !world
+                .entity(entity)
+                .get_ref::<ContentSize>()
+                .unwrap()
+                .is_changed()
+        );
     }
 }
