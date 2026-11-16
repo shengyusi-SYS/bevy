@@ -395,7 +395,30 @@ pub enum ExtractedUiItem {
     Glyphs {
         /// The color, position, and UV rect of each glyph.
         glyphs: Vec<ExtractedGlyph>,
+        /// Local bounds of the rendered quads, independent of their atlas coordinates.
+        bounds: Rect,
     },
+}
+
+impl ExtractedUiItem {
+    fn glyphs(glyphs: Vec<ExtractedGlyph>) -> Self {
+        let bounds = glyphs
+            .iter()
+            .map(|glyph| Rect::from_center_size(glyph.translation, glyph.rect.size()))
+            .reduce(|a, b| a.union(b))
+            .unwrap_or_default();
+        Self::Glyphs { glyphs, bounds }
+    }
+}
+
+impl ExtractedUiNode {
+    fn glyph_run_is_fully_clipped(&self) -> bool {
+        let ExtractedUiItem::Glyphs { bounds, .. } = &self.item else {
+            return false;
+        };
+        clipping::classify_bounds(self.clip.as_ref(), self.transform, *bounds)
+            == clipping::BoundsClip::Outside
+    }
 }
 
 pub struct ExtractedGlyph {
@@ -1735,9 +1758,7 @@ pub fn extract_text_sections(
                             z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                             image: atlas_info.texture,
                             clip: clip.clone(),
-                            item: ExtractedUiItem::Glyphs {
-                                glyphs: mem::take(&mut glyphs),
-                            },
+                            item: ExtractedUiItem::glyphs(mem::take(&mut glyphs)),
                             transform,
                         },
                     );
@@ -1838,9 +1859,7 @@ pub fn extract_text_shadows(
                             z_order: stack_index.0 as f32 + stack_z_offsets::TEXT,
                             image: atlas_info.texture,
                             clip: clip.clone(),
-                            item: ExtractedUiItem::Glyphs {
-                                glyphs: mem::take(&mut glyphs),
-                            },
+                            item: ExtractedUiItem::glyphs(mem::take(&mut glyphs)),
                         },
                     );
             }
@@ -2241,6 +2260,9 @@ pub fn queue_uinodes(
             continue;
         };
         for (render_entity, extracted_uinode) in extracted_sub_uinodes.iter() {
+            if extracted_uinode.glyph_run_is_fully_clipped() {
+                continue;
+            }
             transparent_phase.add_transient(TransparentUi {
                 draw_function,
                 pipeline: *pipeline,
@@ -2493,7 +2515,17 @@ pub fn prepare_uinodes(
                         vertices_index += 3 * (vertices.len() as u32 - 2);
                         indices_index += vertices.len() as u32;
                     }
-                    ExtractedUiItem::Glyphs { glyphs } => {
+                    ExtractedUiItem::Glyphs { glyphs, bounds } => {
+                        let glyph_clip = if clipping::classify_bounds(
+                            extracted_uinode.clip.as_ref(),
+                            extracted_uinode.transform,
+                            *bounds,
+                        ) == clipping::BoundsClip::Inside
+                        {
+                            None
+                        } else {
+                            extracted_uinode.clip.as_ref()
+                        };
                         let image = gpu_images
                             .get(extracted_uinode.image)
                             .expect("Image was checked during batching and should still exist");
@@ -2513,7 +2545,7 @@ pub fn prepare_uinodes(
                             });
 
                             let vertices = clip_polygon(
-                                extracted_uinode.clip.as_ref(),
+                                glyph_clip,
                                 &[
                                     (
                                         positions[0],
@@ -2592,3 +2624,6 @@ pub fn clear_batches(mut commands: Commands, batches_query: Query<Entity, With<U
 
 #[cfg(test)]
 mod translation_tests;
+
+#[cfg(test)]
+mod glyph_culling_tests;

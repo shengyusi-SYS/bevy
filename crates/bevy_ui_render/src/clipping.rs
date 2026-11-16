@@ -1,8 +1,61 @@
-use bevy_math::{Affine2, Vec2};
+use bevy_math::{Affine2, Rect, Vec2};
 use bevy_ui::CalculatedClip;
 use smallvec::SmallVec;
 
 const INLINE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoundsClip {
+    Outside,
+    Inside,
+    Partial,
+}
+
+/// Classify a whole glyph run before clipping its quads. Bounds include actual
+/// glyph overhangs; partial and rotated intersections retain polygon clipping.
+pub(crate) fn classify_bounds(
+    clip: Option<&CalculatedClip>,
+    transform: Affine2,
+    bounds: Rect,
+) -> BoundsClip {
+    let Some(clip) = clip else {
+        return BoundsClip::Inside;
+    };
+    let Some(rects) = clip.rects() else {
+        return BoundsClip::Outside;
+    };
+    let corners = [
+        bounds.min,
+        Vec2::new(bounds.max.x, bounds.min.y),
+        bounds.max,
+        Vec2::new(bounds.min.x, bounds.max.y),
+    ]
+    .map(|point| transform.transform_point2(point));
+    let mut fully_inside = true;
+    for region in rects {
+        let points = corners.map(|point| region.world_to_clip_local.transform_point2(point));
+        for (edge, normal) in [
+            (-region.rect.min.x, Vec2::X),
+            (region.rect.max.x, Vec2::NEG_X),
+            (region.rect.max.y, Vec2::NEG_Y),
+            (-region.rect.min.y, Vec2::Y),
+        ] {
+            if !edge.is_finite() {
+                continue;
+            }
+            let distances = points.map(|point| point.dot(normal) + edge);
+            if distances.iter().all(|distance| *distance < 0.) {
+                return BoundsClip::Outside;
+            }
+            fully_inside &= distances.iter().all(|distance| 0. <= *distance);
+        }
+    }
+    if fully_inside {
+        BoundsClip::Inside
+    } else {
+        BoundsClip::Partial
+    }
+}
 
 /// Clips a polygon using the [Sutherland-Hodgman](https://en.wikipedia.org/wiki/Sutherland-Hodgman_algorithm)
 /// algorithm and interpolates the attribute values.

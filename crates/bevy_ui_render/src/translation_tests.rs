@@ -42,13 +42,11 @@ fn fixture() -> (World, Entity, Entity) {
                 0.,
                 Vec2::new(12., 24.),
             ),
-            item: ExtractedUiItem::Glyphs {
-                glyphs: vec![ExtractedGlyph {
-                    color: LinearRgba::RED,
-                    translation: Vec2::new(2., 4.),
-                    rect: Rect::new(1., 2., 5., 8.),
-                }],
-            },
+            item: ExtractedUiItem::glyphs(vec![ExtractedGlyph {
+                color: LinearRgba::RED,
+                translation: Vec2::new(2., 4.),
+                rect: Rect::new(1., 2., 5., 8.),
+            }]),
         },
     );
     render
@@ -94,7 +92,7 @@ fn scrolling_retains_glyph_entities_and_updates_geometry_from_original_positions
         );
         assert_eq!(node.clip, Some(CalculatedClip::FullyClipped));
         assert_eq!(node.z_order, 3.06);
-        let ExtractedUiItem::Glyphs { glyphs } = &node.item else {
+        let ExtractedUiItem::Glyphs { glyphs, .. } = &node.item else {
             panic!("glyph content was replaced");
         };
         assert_eq!(glyphs[0].color, LinearRgba::RED);
