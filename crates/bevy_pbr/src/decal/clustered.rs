@@ -25,6 +25,7 @@ use bevy_asset::{AssetId, Handle};
 use bevy_camera::visibility::ViewVisibility;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
+    change_detection::DetectChanges,
     entity::{Entity, EntityHashMap},
     query::With,
     resource::Resource,
@@ -38,8 +39,8 @@ use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_asset::RenderAssets,
     render_resource::{
-        binding_types, BindGroupLayoutEntryBuilder, Buffer, BufferUsages, RawBufferVec, Sampler,
-        SamplerBindingType, ShaderType, TextureSampleType, TextureView,
+        binding_types, BindGroupLayoutEntryBuilder, Buffer, BufferId, BufferUsages, RawBufferVec,
+        Sampler, SamplerBindingType, ShaderType, TextureSampleType, TextureView,
     },
     renderer::{RenderAdapter, RenderDevice, RenderQueue},
     settings::WgpuFeatures,
@@ -551,7 +552,21 @@ fn upload_decals(
     mut decals_buffer: ResMut<DecalsBuffer>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    mut uploaded_empty: Local<Option<BufferId>>,
 ) {
+    let empty = render_decals.decals.is_empty();
+    let buffer_id = decals_buffer.buffer().map(Buffer::id);
+    // The default record is required even without decals. Reuse only a real
+    // buffer whose default payload we uploaded, not a cleared or replaced one.
+    if empty
+        && !decals_buffer.is_changed()
+        && decals_buffer.len() == 1
+        && buffer_id.is_some()
+        && buffer_id == *uploaded_empty
+    {
+        tracing::trace!(skipped = true, input_count = 0, "clustered decal upload");
+        return;
+    }
     decals_buffer.clear();
 
     for &decal in &render_decals.decals {
@@ -565,6 +580,17 @@ fn upload_decals(
     }
 
     decals_buffer.write_buffer(&render_device, &render_queue);
+    *uploaded_empty = if empty {
+        decals_buffer.buffer().map(Buffer::id)
+    } else {
+        None
+    };
+    tracing::trace!(
+        skipped = false,
+        input_count = render_decals.decals.len(),
+        bytes = core::mem::size_of::<RenderClusteredDecal>() * decals_buffer.len(),
+        "clustered decal upload"
+    );
 }
 
 /// Returns true if clustered decals are usable on the current platform or false
