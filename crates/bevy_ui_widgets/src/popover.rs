@@ -1,6 +1,7 @@
 //! Framework for positioning of popups, tooltips, and other popover UI elements.
 
 use bevy_app::{App, Plugin, PostUpdate};
+use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
@@ -13,8 +14,8 @@ use bevy_ecs::{
 use bevy_math::{Affine2, Rect, Vec2};
 use bevy_reflect::Reflect;
 use bevy_ui::{
-    ComputedNode, ComputedUiRenderTargetInfo, Node, PositionType, UiGlobalTransform, UiSystems,
-    UiTransform, Val2,
+    ComputedNode, ComputedUiRenderTargetInfo, Display, Node, PositionType, UiGlobalTransform,
+    UiSystems, UiTransform, Val2,
 };
 
 use crate::update_scrollbar_thumb;
@@ -110,6 +111,7 @@ pub(crate) fn position_popover(
         &ComputedUiRenderTargetInfo,
         &Popover,
         &ChildOf,
+        &Visibility,
     )>,
     mut qs_transform: ParamSet<(
         Query<(&ComputedNode, &UiGlobalTransform), Without<Popover>>,
@@ -126,8 +128,15 @@ pub(crate) fn position_popover(
         computed_target,
         popover,
         parent,
+        visibility,
     ) in q_popover.iter_mut()
     {
+        // Hidden retained overlays do not need placement. Besides the unused
+        // work, subpixel roundoff can keep their transform and UI tree dirty.
+        // Once revealed, normal layout and this positioning pass run as usual.
+        if *visibility == Visibility::Hidden || node.display == Display::None {
+            continue;
+        }
         // A rectangle which represents the area of the window.
         let window_rect = Rect {
             min: Vec2::ZERO,
@@ -327,5 +336,74 @@ fn scale_rect(rect: Rect, factor: f32) -> Rect {
     Rect {
         min: rect.min * factor,
         max: rect.max * factor,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{system::RunSystemOnce, world::World};
+
+    #[test]
+    fn hidden_popovers_wait_for_reveal_before_positioning() {
+        // A standalone production system: no renderer, assets or layout mock.
+        // Explicitly hidden and display:none overlays retain their last pose;
+        // revealing either one must still place it below the current anchor.
+        for (visibility, display) in [
+            (Visibility::Hidden, Display::Flex),
+            (Visibility::Inherited, Display::None),
+        ] {
+            let mut world = World::new();
+            let anchor_center = Vec2::new(50.0, 10.0);
+            let anchor = world
+                .spawn((
+                    ComputedNode {
+                        size: Vec2::new(100.0, 20.0),
+                        ..Default::default()
+                    },
+                    UiGlobalTransform::from_translation(anchor_center),
+                ))
+                .id();
+            let popup = world
+                .spawn((
+                    Popover {
+                        positions: vec![PopoverPlacement {
+                            side: PopoverSide::Bottom,
+                            align: PopoverAlign::Center,
+                            gap: 0.0,
+                        }],
+                        window_margin: 0.0,
+                    },
+                    Node {
+                        display,
+                        ..Default::default()
+                    },
+                    visibility,
+                    ComputedNode {
+                        size: Vec2::new(100.0, 40.0),
+                        ..Default::default()
+                    },
+                    ComputedUiRenderTargetInfo::default(),
+                    UiGlobalTransform::from_translation(anchor_center),
+                    ChildOf(anchor),
+                ))
+                .id();
+
+            world.run_system_once(position_popover).unwrap();
+            assert_eq!(
+                world.get::<UiGlobalTransform>(popup).unwrap().translation,
+                anchor_center,
+                "hidden popover positioning must stay idle"
+            );
+
+            world.get_mut::<Node>(popup).unwrap().display = Display::Flex;
+            *world.get_mut::<Visibility>(popup).unwrap() = Visibility::Inherited;
+            world.run_system_once(position_popover).unwrap();
+            assert_eq!(
+                world.get::<UiGlobalTransform>(popup).unwrap().translation,
+                Vec2::new(50.0, 40.0),
+                "revealed popover must use its current geometry"
+            );
+        }
     }
 }
