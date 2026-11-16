@@ -268,6 +268,10 @@ impl Plugin for UiRenderPlugin {
             .add_systems(RenderStartup, init_ui_pipeline)
             .add_systems(
                 ExtractSchedule,
+                retain_empty_uinodes.after(RenderUiSystems::ExtractInlineImages),
+            )
+            .add_systems(
+                ExtractSchedule,
                 (
                     extract_uinode_changes.in_set(RenderUiSystems::ExtractChanges),
                     extract_ui_camera_view
@@ -438,6 +442,8 @@ pub struct ExtractedUiNodes {
     ///
     /// This is a two-level data structure so that we can quickly remove all UI
     /// nodes associated with a main-world entity when it changes.
+    /// A successfully extracted group may be empty; geometry-only translation
+    /// can then retain that result without repeating content extraction.
     pub uinodes: MainEntityHashMap<(Entity, EntityIndexMap<ExtractedUiNode>)>,
     /// UI nodes whose retained content must be extracted again this frame.
     /// Geometry-only translations update existing extracted nodes directly.
@@ -866,6 +872,56 @@ pub fn extract_uinode_changes(
                     Err(_) => break,
                 }
             }
+        }
+    }
+}
+
+// Record successful empty results after all builtin content extractors.
+// Failed camera mappings and externally driven content remain retryable.
+fn retain_empty_uinodes(
+    extracted_uinodes: ResMut<ExtractedUiNodes>,
+    nodes: Extract<
+        Query<
+            &ComputedUiTargetCamera,
+            (
+                UiNodeQueryFilter,
+                Without<EditableText>,
+                Without<TextCursorStyle>,
+                Without<ViewportNode>,
+            ),
+        >,
+    >,
+    camera_map: Extract<UiCameraMap>,
+    #[cfg(feature = "bevy_ui_debug")] debug_options: Extract<Query<&UiDebugOptions>>,
+    #[cfg(feature = "bevy_ui_debug")] global_debug: Extract<Res<GlobalUiDebugOptions>>,
+) {
+    #[cfg(feature = "bevy_ui_debug")]
+    if global_debug.enabled {
+        return;
+    }
+    let extracted = extracted_uinodes.into_inner();
+    let mut mapper = camera_map.get_mapper();
+    for entity in &extracted.changed {
+        if extracted.uinodes.contains_key(entity) {
+            continue;
+        }
+        let Ok(target) = nodes.get(entity.entity()) else {
+            continue;
+        };
+        #[cfg(feature = "bevy_ui_debug")]
+        if debug_options
+            .get(entity.entity())
+            .is_ok_and(|options| options.enabled)
+        {
+            continue;
+        }
+        // A missing map may be a failed extraction that needs retrying, not
+        // an empty result. Viewport/cursor inputs have external dependencies
+        // and intentionally keep their normal retry path as well.
+        if let Some(camera) = mapper.map(target) {
+            extracted
+                .uinodes
+                .insert(*entity, (camera, Default::default()));
         }
     }
 }
@@ -2224,6 +2280,10 @@ pub fn queue_uinodes(
     for (main_entity, (extracted_camera_entity, extracted_sub_uinodes)) in
         extracted_uinodes.uinodes.iter()
     {
+        // Successfully empty content is retained for geometry-only updates.
+        if extracted_sub_uinodes.is_empty() {
+            continue;
+        }
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
                 |(default_camera_view, ui_anti_alias, resolved_space)| {

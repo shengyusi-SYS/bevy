@@ -133,3 +133,124 @@ fn linear_transform_changes_keep_using_full_extraction() {
     assert!(!retained.uinodes.contains_key(&MainEntity::from(source)));
     assert!(render.get_entity(extracted).is_err());
 }
+
+fn empty_fixture(mapped: bool) -> (World, Entity, Entity, Entity) {
+    let (mut render, source, _) = fixture();
+    let rendered_camera = render.spawn_empty().id();
+    let mut main = render.resource_mut::<MainWorld>();
+    main.init_resource::<bevy_ui::UiScale>();
+    let camera = main.spawn(Camera::default()).id();
+    if mapped {
+        main.entity_mut(camera)
+            .insert(RenderEntity::from(rendered_camera));
+    }
+    main.entity_mut(source).insert((
+        bevy_ui::UiTargetCamera(camera),
+        BackgroundColor(bevy_color::Color::NONE),
+    ));
+    main.run_system_cached(bevy_ui::update::propagate_ui_target_cameras)
+        .unwrap();
+    let target = main
+        .get::<bevy_app::Propagate<ComputedUiTargetCamera>>(source)
+        .unwrap()
+        .0;
+    assert_eq!(target.get(), Some(camera));
+    main.entity_mut(source).insert(target);
+    drop(main);
+    (render, source, camera, rendered_camera)
+}
+
+fn empty_step(render: &mut World) {
+    render.resource_mut::<MainWorld>().increment_change_tick();
+    render.run_system_cached(extract_uinode_changes).unwrap();
+    render
+        .run_system_cached(extract_uinode_background_colors)
+        .unwrap();
+    render.run_system_cached(retain_empty_uinodes).unwrap();
+    render.resource_mut::<MainWorld>().clear_trackers();
+}
+
+#[test]
+fn successful_empty_extraction_is_retained_across_scroll_and_yields_to_content() {
+    let (mut render, source, _, _) = empty_fixture(true);
+    empty_step(&mut render);
+    for offset in [20.0, -40.0, 0.0] {
+        render
+            .resource_mut::<MainWorld>()
+            .entity_mut(source)
+            .insert((
+                UiGlobalTransform::from(Affine2::from_translation(Vec2::new(offset, 10.))),
+                CalculatedClip::FullyClipped,
+            ));
+        empty_step(&mut render);
+        let retained = render.resource::<ExtractedUiNodes>();
+        assert!(
+            !retained.changed.contains(&MainEntity::from(source)),
+            "scrolling a successfully extracted empty container must not re-extract its content"
+        );
+        assert!(retained.uinodes[&MainEntity::from(source)].1.is_empty());
+    }
+    render
+        .resource_mut::<MainWorld>()
+        .entity_mut(source)
+        .insert(BackgroundColor(bevy_color::Color::WHITE));
+    empty_step(&mut render);
+    let retained = render.resource::<ExtractedUiNodes>();
+    assert!(retained.changed.contains(&MainEntity::from(source)));
+    assert_eq!(
+        retained.uinodes[&MainEntity::from(source)].1.len(),
+        1,
+        "real content must replace the retained empty result"
+    );
+}
+
+#[test]
+fn failed_camera_mapping_stays_retryable_after_only_geometry_changes() {
+    let (mut render, source, camera, rendered_camera) = empty_fixture(false);
+    render
+        .resource_mut::<MainWorld>()
+        .entity_mut(source)
+        .insert(BackgroundColor(bevy_color::Color::WHITE));
+    empty_step(&mut render);
+    assert!(
+        !render
+            .resource::<ExtractedUiNodes>()
+            .uinodes
+            .contains_key(&MainEntity::from(source))
+    );
+    {
+        let mut main = render.resource_mut::<MainWorld>();
+        main.entity_mut(camera)
+            .insert(RenderEntity::from(rendered_camera));
+        main.entity_mut(source)
+            .insert(UiGlobalTransform::from(Affine2::from_translation(
+                Vec2::new(30., 50.),
+            )));
+    }
+    empty_step(&mut render);
+    assert_eq!(
+        render.resource::<ExtractedUiNodes>().uinodes[&MainEntity::from(source)]
+            .1
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn retained_empty_content_is_removed_with_its_main_entity() {
+    let (mut render, source, _, _) = empty_fixture(true);
+    empty_step(&mut render);
+    assert!(
+        render.resource::<ExtractedUiNodes>().uinodes[&MainEntity::from(source)]
+            .1
+            .is_empty()
+    );
+    render.resource_mut::<MainWorld>().despawn(source);
+    empty_step(&mut render);
+    assert!(
+        !render
+            .resource::<ExtractedUiNodes>()
+            .uinodes
+            .contains_key(&MainEntity::from(source))
+    );
+}
