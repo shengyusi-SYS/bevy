@@ -416,8 +416,49 @@ pub struct ExtractedUiNodes {
     /// This is a two-level data structure so that we can quickly remove all UI
     /// nodes associated with a main-world entity when it changes.
     pub uinodes: MainEntityHashMap<(Entity, EntityIndexMap<ExtractedUiNode>)>,
-    /// UI nodes that changed this frame.
+    /// UI nodes whose retained content must be extracted again this frame.
+    /// Geometry-only translations update existing extracted nodes directly.
     pub changed: MainEntityHashSet,
+}
+
+// Content belongs to the retained extracted node; translation alone does not
+// require rebuilding its glyph vectors or replacing its render entities.
+struct RetainedUiGeometry {
+    source: Affine2,
+    nodes: Option<Vec<(Entity, Affine2)>>,
+}
+
+impl RetainedUiGeometry {
+    fn translate(
+        &mut self,
+        transform: Affine2,
+        clip: Option<&CalculatedClip>,
+        nodes: &mut EntityIndexMap<ExtractedUiNode>,
+    ) -> bool {
+        if transform.matrix2 != self.source.matrix2 {
+            return false;
+        }
+        let originals = self.nodes.get_or_insert_with(|| {
+            nodes
+                .iter()
+                .map(|(entity, node)| (*entity, node.transform))
+                .collect()
+        });
+        if originals.len() != nodes.len() {
+            return false;
+        }
+        let offset = transform.translation - self.source.translation;
+        for ((entity, node), (original_entity, original)) in nodes.iter_mut().zip(originals) {
+            if entity != original_entity {
+                return false;
+            }
+            // Derive from the initial extraction, not last frame's result.
+            node.transform = *original;
+            node.transform.translation += offset;
+            node.clip = clip.cloned();
+        }
+        true
+    }
 }
 
 /// A query filter that matches all UI nodes.
@@ -428,6 +469,37 @@ type UiNodeQueryFilter = (
     With<InheritedVisibility>,
     With<ComputedUiTargetCamera>,
 );
+
+/// Main-world geometry inputs and the retained source positions for UI extraction.
+#[derive(SystemParam)]
+pub struct UiGeometryQueries<'w, 's> {
+    all: Extract<
+        'w,
+        's,
+        Query<'static, 'static, (Entity, &'static UiGlobalTransform), UiNodeQueryFilter>,
+    >,
+    changed: Extract<
+        'w,
+        's,
+        Query<
+            'static,
+            'static,
+            (
+                Entity,
+                &'static UiGlobalTransform,
+                Option<&'static CalculatedClip>,
+                Has<EditableText>,
+            ),
+            (
+                UiNodeQueryFilter,
+                Or<(Changed<UiGlobalTransform>, Changed<CalculatedClip>)>,
+            ),
+        >,
+    >,
+    #[cfg(feature = "bevy_ui_debug")]
+    debug: Extract<'w, 's, Query<'static, 'static, &'static UiDebugOptions>>,
+    cache: Local<'s, MainEntityHashMap<RetainedUiGeometry>>,
+}
 
 // Note: Whenever you add a new component that affects UI rendering, make sure
 // to add a `Changed` query filter and a reference to the `RemovedComponents`
@@ -443,7 +515,7 @@ type UiNodeQueryFilter = (
 pub fn extract_uinode_changes(
     mut commands: Commands,
     mut extracted_uinodes: ResMut<ExtractedUiNodes>,
-    all_uinodes_query: Extract<Query<Entity, UiNodeQueryFilter>>,
+    geometry: UiGeometryQueries,
     changed_uinodes_query: Extract<
         Query<
             Entity,
@@ -453,9 +525,7 @@ pub fn extract_uinode_changes(
                     Or<(
                         Changed<ComputedNode>,
                         Changed<ComputedStackIndex>,
-                        Changed<UiGlobalTransform>,
                         Changed<InheritedVisibility>,
-                        Changed<CalculatedClip>,
                         Changed<ComputedUiTargetCamera>,
                         Changed<BackgroundColor>,
                         Changed<OuterColor>,
@@ -579,6 +649,13 @@ pub fn extract_uinode_changes(
     #[cfg(feature = "bevy_ui_debug")] global_ui_debug_options: Extract<Res<GlobalUiDebugOptions>>,
     mut extra_nodes_to_invalidate: Local<MainEntityHashSet>,
 ) {
+    let UiGeometryQueries {
+        all: all_uinodes_query,
+        changed: geometry_query,
+        #[cfg(feature = "bevy_ui_debug")]
+            debug: debug_options_query,
+        cache: mut geometry_cache,
+    } = geometry;
     extracted_uinodes.changed.clear();
 
     // If the debug options changed, we wipe everything.
@@ -590,13 +667,15 @@ pub fn extract_uinode_changes(
     let must_wipe_all_nodes = false;
 
     if must_wipe_all_nodes {
-        for main_entity in &all_uinodes_query {
+        for (main_entity, _) in &all_uinodes_query {
             process_changed_entity(
                 main_entity.into(),
                 &mut commands,
                 &text_span_parent_query,
                 &text_query,
                 &mut extracted_uinodes,
+                &mut geometry_cache,
+                &all_uinodes_query,
                 Some(&mut extra_nodes_to_invalidate),
             );
         }
@@ -640,6 +719,8 @@ pub fn extract_uinode_changes(
                 &text_span_parent_query,
                 &text_query,
                 &mut extracted_uinodes,
+                &mut geometry_cache,
+                &all_uinodes_query,
                 Some(&mut extra_nodes_to_invalidate),
             );
         }
@@ -657,6 +738,8 @@ pub fn extract_uinode_changes(
                 &text_span_parent_query,
                 &text_query,
                 &mut extracted_uinodes,
+                &mut geometry_cache,
+                &all_uinodes_query,
                 Some(&mut extra_nodes_to_invalidate),
             );
         }
@@ -669,6 +752,43 @@ pub fn extract_uinode_changes(
             &text_span_parent_query,
             &text_query,
             &mut extracted_uinodes,
+            &mut geometry_cache,
+            &all_uinodes_query,
+            None,
+        );
+    }
+
+    for (entity, transform, clip, editable) in &geometry_query {
+        let main_entity = MainEntity::from(entity);
+        if extracted_uinodes.changed.contains(&main_entity) {
+            continue;
+        }
+        #[cfg(feature = "bevy_ui_debug")]
+        let debug_overlay = global_ui_debug_options.enabled
+            || debug_options_query
+                .get(entity)
+                .is_ok_and(|options| options.enabled);
+        #[cfg(not(feature = "bevy_ui_debug"))]
+        let debug_overlay = false;
+
+        // Editable text derives an additional scrolling clip. Debug outlines
+        // may deliberately ignore clipping. Preserve their complete extractors.
+        if !editable
+            && !debug_overlay
+            && let Some(geometry) = geometry_cache.get_mut(&main_entity)
+            && let Some((_, nodes)) = extracted_uinodes.uinodes.get_mut(&main_entity)
+            && geometry.translate(Affine2::from(*transform), clip, nodes)
+        {
+            continue;
+        }
+        process_changed_entity(
+            main_entity,
+            &mut commands,
+            &text_span_parent_query,
+            &text_query,
+            &mut extracted_uinodes,
+            &mut geometry_cache,
+            &all_uinodes_query,
             None,
         );
     }
@@ -679,8 +799,21 @@ pub fn extract_uinode_changes(
         text_span_parent_query: &Query<&ChildOf, Or<(With<TextSpan>, With<InlineBox>)>>,
         text_query: &Query<Entity, With<Text>>,
         extracted_uinodes: &mut ExtractedUiNodes,
+        geometry_cache: &mut MainEntityHashMap<RetainedUiGeometry>,
+        source_query: &Query<(Entity, &UiGlobalTransform), UiNodeQueryFilter>,
         maybe_extra_nodes_to_invalidate: Option<&mut MainEntityHashSet>,
     ) {
+        geometry_cache.remove(&main_entity);
+        if let Ok((_, transform)) = source_query.get(main_entity.entity()) {
+            geometry_cache.insert(
+                main_entity,
+                RetainedUiGeometry {
+                    source: (*transform).into(),
+                    nodes: None,
+                },
+            );
+        }
+
         // Mark the node as changed so that the other `extract_` systems will
         // know to process it.
         extracted_uinodes.changed.insert(main_entity);
@@ -2456,3 +2589,6 @@ pub fn clear_batches(mut commands: Commands, batches_query: Query<Entity, With<U
         commands.entity(entity).remove::<UiBatch>();
     }
 }
+
+#[cfg(test)]
+mod translation_tests;
