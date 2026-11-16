@@ -2837,6 +2837,22 @@ impl CalculatedClip {
     #[inline]
     pub fn push_rect(&mut self, rect: Rect, world_to_clip_local: Affine2) {
         if let Self::Rects(rects) = self {
+            if let Some(previous) = rects.last_mut()
+                && previous.world_to_clip_local.matrix2 == world_to_clip_local.matrix2
+            {
+                // The clip axes and scale agree. Express the new rect in the
+                // previous rect's local space without transforming infinite edges.
+                let offset =
+                    previous.world_to_clip_local.translation - world_to_clip_local.translation;
+                let min = previous.rect.min.max(rect.min + offset);
+                let max = previous.rect.max.min(rect.max + offset);
+                if min.x > max.x || min.y > max.y {
+                    *self = Self::FullyClipped;
+                } else {
+                    previous.rect = Rect { min, max };
+                }
+                return;
+            }
             rects.push(CalculatedClipRect {
                 rect,
                 world_to_clip_local,
@@ -3820,3 +3836,7 @@ mod tests {
         assert!(abs_diff_eq_rect(r, s));
     }
 }
+
+#[cfg(test)]
+#[path = "ui_node/coaxial_clip_tests.rs"]
+mod coaxial_clip_tests;
