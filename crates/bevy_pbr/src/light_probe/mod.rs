@@ -472,7 +472,7 @@ fn gather_light_probes<C>(
 // a single structure, ready to be passed to the shader.
 fn upload_light_probes(
     mut commands: Commands,
-    views: Query<Entity, With<ExtractedView>>,
+    views: Query<Entity, (With<ExtractedView>, With<Camera3d>)>,
     mut light_probes_buffer: ResMut<LightProbesBuffer>,
     mut view_light_probes_query: Query<(
         Option<&RenderViewLightProbes<EnvironmentMapLight>>,
@@ -481,10 +481,18 @@ fn upload_light_probes(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    // If there are no views, bail.
+    // Probe uniforms are consumed by the 3D mesh pipeline. Retained inactive
+    // cameras may still have Camera3d, so require an extracted view as well.
     if views.is_empty() {
+        tracing::trace!(skipped = true, views = 0, "light probe upload");
         return;
     }
+
+    tracing::trace!(
+        skipped = false,
+        views = views.iter().len(),
+        "light probe upload"
+    );
 
     // Initialize the uniform buffer writer.
     let Some(mut writer) =
