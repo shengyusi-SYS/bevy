@@ -337,6 +337,7 @@ pub fn update_editable_text_layout(
         mut generation,
     ) in input_field_query.iter_mut()
     {
+        info.cursor_blink_remaining = None;
         let cursor_width = editable_text.cursor_width;
         let cursor_blink_period = editable_text.cursor_blink_period;
         let cursor_margin = editable_text.cursor_margin;
@@ -532,6 +533,9 @@ pub fn update_editable_text_layout(
                 )
                 .map(bounding_box_to_rect)
                 .map(|rect| (*cursor_timer < cursor_blink_period / 2, rect));
+            info.cursor_blink_remaining = info
+                .cursor
+                .and_then(|_| cursor_blink_remaining(*cursor_timer, cursor_blink_period));
         } else {
             info.cursor = driver
                 .editor
@@ -578,5 +582,39 @@ fn bounding_box_to_rect(geom: BoundingBox) -> Rect {
             x: geom.x1 as f32,
             y: geom.y1 as f32,
         },
+    }
+}
+
+// The caller has reset elapsed to zero after focus/layout changes or expiry.
+fn cursor_blink_remaining(elapsed: Duration, period: Duration) -> Option<Duration> {
+    let half = period / 2;
+    if half.is_zero() {
+        return None;
+    }
+    Some(if elapsed < half {
+        half - elapsed
+    } else {
+        period - elapsed
+    })
+}
+
+#[cfg(test)]
+mod blink_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn next_visibility_edge_preserves_both_halves_and_clears_with_layout() {
+        let period = Duration::from_secs(1);
+        for (elapsed, remaining) in [(0, 500), (233, 267), (500, 500), (817, 183)] {
+            assert_eq!(
+                cursor_blink_remaining(Duration::from_millis(elapsed), period),
+                Some(Duration::from_millis(remaining))
+            );
+        }
+        assert_eq!(cursor_blink_remaining(Duration::ZERO, Duration::ZERO), None);
+        let mut layout = TextLayoutInfo::default();
+        layout.cursor_blink_remaining = Some(Duration::from_millis(20));
+        layout.clear();
+        assert_eq!(layout.cursor_blink_remaining, None);
     }
 }

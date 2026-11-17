@@ -10,6 +10,7 @@ use bevy_math::{Rect, Vec2};
 use bevy_platform::hash::FixedHasher;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use core::hash::BuildHasher;
+use core::time::Duration;
 use parley::style::{OverflowWrap, TextWrapMode, WordBreak};
 use parley::{Alignment, AlignmentOptions, Layout, PositionedLayoutItem, StyleProperty};
 use swash::FontRef;
@@ -497,6 +498,11 @@ pub struct TextLayoutInfo {
     pub size: Vec2,
     /// Cursor visibility, size and position for editing
     pub cursor: Option<(bool, Rect)>,
+    /// Time until the editable cursor next changes visibility, measured from
+    /// the real-clock sample used for this layout update. `None` means no
+    /// cursor visibility change is currently scheduled. A host using reactive
+    /// updates can wake at this deadline without maintaining another blink clock.
+    pub cursor_blink_remaining: Option<Duration>,
     /// Selection rects
     pub selection_rects: Vec<Rect>,
     /// Underline rects for the active IME preedit/compose region.
@@ -515,6 +521,7 @@ impl TextLayoutInfo {
         self.run_geometry.clear();
         self.size = Vec2::ZERO;
         self.cursor = None;
+        self.cursor_blink_remaining = None;
         self.selection_rects.clear();
         self.preedit_underline_rects.clear();
     }
@@ -528,6 +535,7 @@ impl Default for TextLayoutInfo {
             run_geometry: Default::default(),
             size: Vec2::ZERO,
             cursor: None,
+            cursor_blink_remaining: None,
             selection_rects: Default::default(),
             preedit_underline_rects: Default::default(),
             inline_boxes: Default::default(),
