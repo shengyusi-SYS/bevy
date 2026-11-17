@@ -10,17 +10,34 @@ use super::{IterQueryData, QueryFilter, QueryItem, QueryState, ReadOnlyQueryData
 
 use alloc::vec::Vec;
 
-// Temporary opt-in experiment: isolate small-query dispatch from outer ECS
-// parallelism before selecting a public/per-world policy. No default changes.
 #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
-fn diagnostic_query_min_rows() -> u32 {
-    static MINIMUM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MINIMUM.get_or_init(|| {
-        std::env::var("BEVY_DIAGNOSTIC_QUERY_MIN_ROWS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0)
-    })
+static MINIMUM_PARALLEL_QUERY_ROWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+fn query_minimum_from_environment_or(default: u32) -> u32 {
+    std::env::var("BEVY_DIAGNOSTIC_QUERY_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Initializes the process-wide candidate-row threshold for parallel queries.
+///
+/// Call before the first parallel query. Smaller queries execute on the calling
+/// thread; task pool sizes and schedule executors are unchanged. The default is
+/// zero. The existing `BEVY_DIAGNOSTIC_QUERY_MIN_ROWS` environment override takes
+/// precedence, allowing same-binary diagnostic comparisons.
+///
+/// Returns the active threshold. An earlier initialization is retained, so this
+/// never changes a running policy.
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+pub fn initialize_parallel_query_min_rows(minimum: u32) -> u32 {
+    *MINIMUM_PARALLEL_QUERY_ROWS.get_or_init(|| query_minimum_from_environment_or(minimum))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+fn parallel_query_min_rows() -> u32 {
+    initialize_parallel_query_min_rows(0)
 }
 
 /// A parallel iterator over query results of a [`Query`](crate::system::Query).
@@ -116,7 +133,7 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
         #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
         {
             let thread_count = bevy_tasks::ComputeTaskPool::get().thread_num();
-            if thread_count <= 1 || self.has_fewer_matched_rows(diagnostic_query_min_rows()) {
+            if thread_count <= 1 || self.has_fewer_matched_rows(parallel_query_min_rows()) {
                 let init = init();
                 // SAFETY: See the safety comment above.
                 unsafe {
