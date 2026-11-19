@@ -11,6 +11,7 @@ const BORDER_RIGHT: u32 = 1024u;
 const BORDER_BOTTOM: u32 = 2048u;
 const BORDER_ANY: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
 const INVERT: u32 = 4096u;
+const GLYPH_ALPHA_MASK: u32 = 8192u;
 
 fn enabled(flags: u32, mask: u32) -> bool {
     return (flags & mask) != 0u;
@@ -254,7 +255,8 @@ fn draw_uinode_background(
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
+    let texel = textureSample(sprite_texture, sprite_sampler, in.uv);
+    let texture_color = select(texel, vec4(1.0, 1.0, 1.0, texel.r), enabled(in.flags, GLYPH_ALPHA_MASK));
 
     // Only use the color sampled from the texture if the `TEXTURED` flag is enabled.
     // This allows us to draw both textured and untextured shapes together in the same batch.

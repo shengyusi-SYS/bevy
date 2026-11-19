@@ -2198,6 +2198,7 @@ pub mod shader_flags {
     pub const BORDER_BOTTOM: u32 = 2048;
     pub const BORDER_ALL: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
     pub const INVERT: u32 = 4096;
+    pub const GLYPH_ALPHA_MASK: u32 = 8192;
 }
 
 pub fn queue_uinodes(
@@ -2531,6 +2532,11 @@ pub fn prepare_uinodes(
                             .expect("Image was checked during batching and should still exist");
 
                         let atlas_extent = image.size_2d().as_vec2();
+                        let flags = if image.texture_descriptor.format == TextureFormat::R8Unorm {
+                            shader_flags::TEXTURED | shader_flags::GLYPH_ALPHA_MASK
+                        } else {
+                            shader_flags::TEXTURED
+                        };
 
                         for glyph in glyphs {
                             let color = glyph.color.to_f32_array();
@@ -2579,7 +2585,7 @@ pub fn prepare_uinodes(
                                     position: vertex.0.extend(0.).into(),
                                     uv: vertex.1.into(),
                                     color,
-                                    flags: shader_flags::TEXTURED,
+                                    flags,
                                     radius: [[0.0; 4]; 2],
                                     border: [0.0; 4],
                                     size: rect_size.into(),

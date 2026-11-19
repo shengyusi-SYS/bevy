@@ -99,6 +99,7 @@ bitflags::bitflags! {
         const DEBAND_DITHER                     = 1 << 1;
         const SRGB_COMPOSITING                  = 1 << 2;
         const OKLAB_COMPOSITING                 = 1 << 3;
+        const GLYPH_ALPHA_MASK                  = 1 << 24;
         const COLOR_TARGET_FORMAT_RESERVED_BITS = Self::COLOR_TARGET_FORMAT_MASK_BITS << Self::COLOR_TARGET_FORMAT_SHIFT_BITS;
         const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;
         const TONEMAP_METHOD_RESERVED_BITS      = Self::TONEMAP_METHOD_MASK_BITS << Self::TONEMAP_METHOD_SHIFT_BITS;
@@ -218,6 +219,10 @@ impl SpecializedRenderPipeline for SpritePipeline {
             shader_defs.push("OKLAB_OUTPUT".into());
         }
 
+        if key.contains(SpritePipelineKey::GLYPH_ALPHA_MASK) {
+            shader_defs.push("GLYPH_ALPHA_MASK".into());
+        }
+
         let format = key.target_format();
 
         let instance_rate_vertex_buffer_layout = VertexBufferLayout {
@@ -330,6 +335,19 @@ pub enum ExtractedSpriteKind {
     /// Indexes into the list of [`ExtractedSlice`]s stored in the [`ExtractedSlices`] resource
     /// Used for elements composed from multiple sprites such as text or nine-patched borders
     Slices { indices: Range<usize> },
+    /// Text quads sampling glyph coverage from the red channel of an R8 atlas.
+    GlyphMask { indices: Range<usize> },
+}
+
+impl ExtractedSpriteKind {
+    #[cfg(feature = "bevy_text")]
+    pub(crate) fn glyphs(indices: Range<usize>, is_alpha_mask: bool) -> Self {
+        if is_alpha_mask {
+            Self::GlyphMask { indices }
+        } else {
+            Self::Slices { indices }
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -477,6 +495,7 @@ pub fn queue_sprites(
         }
 
         let pipeline = pipelines.specialize(&pipeline_cache, &sprite_pipeline, view_key);
+        let mut mask_pipeline = None;
 
         view_entities.clear();
         if let Some(visible_entities) = visible_entities.get::<Sprite>() {
@@ -497,6 +516,19 @@ pub fn queue_sprites(
             if !view_entities.contains(view_index as usize) {
                 continue;
             }
+
+            let pipeline = if matches!(extracted_sprite.kind, ExtractedSpriteKind::GlyphMask { .. })
+            {
+                *mask_pipeline.get_or_insert_with(|| {
+                    pipelines.specialize(
+                        &pipeline_cache,
+                        &sprite_pipeline,
+                        view_key | SpritePipelineKey::GLYPH_ALPHA_MASK,
+                    )
+                })
+            } else {
+                pipeline
+            };
 
             // These items will be sorted by depth with other phase items
             let sort_key = FloatOrd(extracted_sprite.transform.translation().z);
@@ -590,7 +622,7 @@ pub fn prepare_sprite_image_bind_groups(
         let mut current_batch = None;
         let mut batch_item_index = 0;
         let mut batch_image_size = Vec2::ZERO;
-        let mut batch_image_handle = None;
+        let mut batch_key = None;
 
         // Iterate through the phase items and detect when successive sprites that can be batched.
         // Spawn an entity with a `SpriteBatch` component for each possible batch.
@@ -605,19 +637,20 @@ pub fn prepare_sprite_image_bind_groups(
             else {
                 // If there is a phase item that is not a sprite, then we must start a new
                 // batch to draw the other phase item(s) and to respect draw order. This can be
-                // done by invalidating the batch_image_handle
-                batch_image_handle = None;
+                // done by invalidating the batch key
+                batch_key = None;
                 continue;
             };
 
-            if batch_image_handle != Some(extracted_sprite.image_handle_id) {
+            let key = (extracted_sprite.image_handle_id, item.pipeline);
+            if batch_key != Some(key) {
                 let Some(gpu_image) = gpu_images.get(extracted_sprite.image_handle_id) else {
                     continue;
                 };
 
                 batch_image_size = gpu_image.size_2d().as_vec2();
                 let image_handle = extracted_sprite.image_handle_id;
-                batch_image_handle = Some(image_handle);
+                batch_key = Some(key);
                 image_bind_groups
                     .values
                     .entry(image_handle)
@@ -668,7 +701,8 @@ pub fn prepare_sprite_image_bind_groups(
                     current_batch.as_mut().unwrap().get_mut().range.end += 1;
                     index += 1;
                 }
-                ExtractedSpriteKind::Slices { ref indices } => {
+                ExtractedSpriteKind::Slices { ref indices }
+                | ExtractedSpriteKind::GlyphMask { ref indices } => {
                     for i in indices.clone() {
                         let slice = &extracted_slices.slices[i];
                         let rect = slice.rect;

@@ -57,7 +57,11 @@ fn vertex(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    var color = in.color * textureSample(sprite_texture, sprite_sampler, in.uv);
+    let texel = textureSample(sprite_texture, sprite_sampler, in.uv);
+@if(GLYPH_ALPHA_MASK)
+    var color = in.color * vec4(1.0, 1.0, 1.0, texel.r);
+@else
+    var color = in.color * texel;
 
 @if(TONEMAP_IN_SHADER)
     color = tonemapping::tone_mapping(color, view.color_grading);

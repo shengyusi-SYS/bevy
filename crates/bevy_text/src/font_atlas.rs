@@ -1,5 +1,5 @@
 use bevy_asset::{Assets, Handle, RenderAssetUsages};
-use bevy_image::{prelude::*, ImageSampler, ToExtents};
+use bevy_image::{prelude::*, ImageSampler, TextureFormatPixelInfo, ToExtents};
 use bevy_math::{UVec2, Vec2};
 use bevy_platform::collections::HashMap;
 use swash::scale::Scaler;
@@ -47,11 +47,27 @@ impl FontAtlas {
         size: UVec2,
         font_smoothing: FontSmoothing,
     ) -> FontAtlas {
+        Self::with_format(
+            textures,
+            size,
+            font_smoothing,
+            TextureFormat::Rgba8UnormSrgb,
+        )
+    }
+
+    fn with_format(
+        textures: &mut Assets<Image>,
+        size: UVec2,
+        font_smoothing: FontSmoothing,
+        format: TextureFormat,
+    ) -> Self {
         let mut image = Image::new_fill(
             size.to_extents(),
             TextureDimension::D2,
-            &[0, 0, 0, 0],
-            TextureFormat::Rgba8UnormSrgb,
+            &[0; 4][..format
+                .pixel_size()
+                .expect("uncompressed glyph atlas format")],
+            format,
             // Need to keep this image CPU persistent in order to add additional glyphs later on
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
         );
@@ -99,6 +115,14 @@ impl FontAtlas {
         offset: Vec2,
         is_alpha_mask: bool,
     ) -> Result<(), TextError> {
+        let atlas_format = textures
+            .get(&self.texture)
+            .ok_or(TextError::MissingAtlasTexture)?
+            .texture_descriptor
+            .format;
+        if atlas_format != texture.texture_descriptor.format {
+            return Err(TextError::FailedToAddGlyph(key.glyph_id));
+        }
         let mut atlas_texture = textures
             .get_mut(&self.texture)
             .ok_or(TextError::MissingAtlasTexture)?;
@@ -170,7 +194,12 @@ pub fn add_glyph_to_atlas(
             .next_power_of_two()
             .max(256);
 
-        let mut new_atlas = FontAtlas::new(textures, UVec2::splat(containing), font_smoothing);
+        let mut new_atlas = FontAtlas::with_format(
+            textures,
+            UVec2::splat(containing),
+            font_smoothing,
+            glyph_texture.texture_descriptor.format,
+        );
 
         new_atlas.add_glyph(
             textures,
@@ -188,16 +217,12 @@ pub fn add_glyph_to_atlas(
 }
 
 /// Get the texture of the glyph as a rendered image, and its offset
-#[expect(
-    clippy::identity_op,
-    reason = "Alignment improves clarity during RGBA operations."
-)]
 pub fn get_outlined_glyph_texture(
     scaler: &mut Scaler,
     glyph_id: u16,
     font_smoothing: FontSmoothing,
 ) -> Result<(Image, Vec2, bool), TextError> {
-    let image = swash::scale::Render::new(&[
+    let mut image = swash::scale::Render::new(&[
         swash::scale::Source::ColorOutline(0),
         swash::scale::Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
         swash::scale::Source::Outline,
@@ -211,35 +236,16 @@ pub fn get_outlined_glyph_texture(
     let width = image.placement.width;
     let height = image.placement.height;
 
-    let px = (width * height) as usize;
-    let rgba = match image.content {
-        swash::scale::image::Content::Mask => {
-            let mut rgba = vec![0u8; px * 4];
-            match font_smoothing {
-                FontSmoothing::AntiAliased => {
-                    for i in 0..px {
-                        let a = image.data[i];
-                        rgba[i * 4 + 0] = 255; // R
-                        rgba[i * 4 + 1] = 255; // G
-                        rgba[i * 4 + 2] = 255; // B
-                        rgba[i * 4 + 3] = a; // A from swash
-                    }
-                }
-                FontSmoothing::None => {
-                    for i in 0..px {
-                        let a = image.data[i];
-                        rgba[i * 4 + 0] = 255; // R
-                        rgba[i * 4 + 1] = 255; // G
-                        rgba[i * 4 + 2] = 255; // B
-                        rgba[i * 4 + 3] = if 127 < a { 255 } else { 0 }; // A from swash
-                    }
-                }
+    let is_alpha_mask = image.content == swash::scale::image::Content::Mask;
+    let format = if is_alpha_mask {
+        if font_smoothing == FontSmoothing::None {
+            for coverage in &mut image.data {
+                *coverage = if *coverage > 127 { 255 } else { 0 };
             }
-            rgba
         }
-        swash::scale::image::Content::Color | swash::scale::image::Content::SubpixelMask => {
-            image.data
-        }
+        TextureFormat::R8Unorm
+    } else {
+        TextureFormat::Rgba8UnormSrgb
     };
 
     Ok((
@@ -250,12 +256,12 @@ pub fn get_outlined_glyph_texture(
                 depth_or_array_layers: 1,
             },
             TextureDimension::D2,
-            rgba,
-            TextureFormat::Rgba8UnormSrgb,
+            image.data,
+            format,
             RenderAssetUsages::MAIN_WORLD,
         ),
         Vec2::new(left as f32, -top as f32),
-        image.content == swash::scale::image::Content::Mask,
+        is_alpha_mask,
     ))
 }
 

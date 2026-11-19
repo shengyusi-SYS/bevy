@@ -142,9 +142,7 @@ pub fn extract_text2d_sprite(
                         color,
                         image_handle_id: atlas_info.texture,
                         flip_y: true,
-                        kind: ExtractedSpriteKind::Slices {
-                            indices: start..end,
-                        },
+                        kind: ExtractedSpriteKind::glyphs(start..end, atlas_info.is_alpha_mask),
                     });
                     start = end;
                 }
@@ -240,9 +238,7 @@ pub fn extract_text2d_sprite(
                     color,
                     image_handle_id: atlas_info.texture,
                     flip_y: true,
-                    kind: ExtractedSpriteKind::Slices {
-                        indices: start..end,
-                    },
+                    kind: ExtractedSpriteKind::glyphs(start..end, atlas_info.is_alpha_mask),
                 });
                 start = end;
             }
