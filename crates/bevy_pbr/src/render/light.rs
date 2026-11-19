@@ -1505,12 +1505,18 @@ pub fn prepare_lights(
     let mut directional_light_depth_attachments =
         HashMap::<u32, DepthStencilViewAttachment>::default();
 
+    // Keep the required binding shape even when no light casts shadows.
+    let point_shadow_size = if point_light_shadow_maps_count == 0 {
+        1
+    } else {
+        point_light_shadow_map.size as u32
+    };
     let point_light_depth_texture = texture_cache.get(
         &render_device,
         TextureDescriptor {
             size: Extent3d {
-                width: point_light_shadow_map.size as u32,
-                height: point_light_shadow_map.size as u32,
+                width: point_shadow_size,
+                height: point_shadow_size,
                 depth_or_array_layers: point_light_shadow_maps_count.max(1) as u32 * 6,
             },
             mip_level_count: 1,
@@ -1553,17 +1559,20 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
+    let directional_shadow_layers = num_directional_cascades_enabled + spot_light_shadow_maps_count;
+    let directional_shadow_size = if directional_shadow_layers == 0 {
+        1
+    } else {
+        (directional_light_shadow_map.size as u32)
+            .min(render_device.limits().max_texture_dimension_2d)
+    };
     let directional_light_depth_texture = texture_cache.get(
         &render_device,
         TextureDescriptor {
             size: Extent3d {
-                width: (directional_light_shadow_map.size as u32)
-                    .min(render_device.limits().max_texture_dimension_2d),
-                height: (directional_light_shadow_map.size as u32)
-                    .min(render_device.limits().max_texture_dimension_2d),
-                depth_or_array_layers: (num_directional_cascades_enabled
-                    + spot_light_shadow_maps_count)
-                    .max(1) as u32,
+                width: directional_shadow_size,
+                height: directional_shadow_size,
+                depth_or_array_layers: directional_shadow_layers.max(1) as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
