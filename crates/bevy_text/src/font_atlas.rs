@@ -164,11 +164,11 @@ pub fn add_glyph_to_atlas(
             .height
             .max(glyph_texture.width());
         // Returns the smallest power-of-two atlas size that fits the glyph and its
-        // required padding, with a minimum size of 512 pixels.
+        // required padding, with a minimum size of 256 pixels.
         let containing = glyph_max_size
             .saturating_add(GLYPH_ATLAS_PADDING * 2)
             .next_power_of_two()
-            .max(512);
+            .max(256);
 
         let mut new_atlas = FontAtlas::new(textures, UVec2::splat(containing), font_smoothing);
 
